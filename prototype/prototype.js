@@ -2,61 +2,74 @@
 const http = require('http')
 const got = require('got')
 
-function netdelay () {
-  return 500 * (Math.random() + 0.5)
-}
+class RPC {
+  constructor (id) {
+    this._id = id
+    this._next_id = 1
+  }
 
-let next_id = 0
-function rpcServer (port, handler) {
-  http.createServer((req, res) => {
-    let parts = []
-    let id = next_id++
-    req.on('data', part => parts.push(part))
-    req.on('end', () => {
-      let name = require('url').parse(req.url).pathname.replace(/\//g, '')
-      new Promise((resolve, reject) => {
-        let text = Buffer.concat(parts).toString('utf8')
-        let json = JSON.parse(text)
-        setTimeout(() => {
-          console.log(Date.now(), 'IN<-', id, name, text)
-          resolve(json)
-        }, netdelay())
-      }).then(json => handler(name, json)).then(
-        result => [200, new Buffer(JSON.stringify(result), 'utf8')],
-        error => [500, new Buffer(error.toString(), 'utf8')]
-      ).then(code_buf => {
-        console.log(Date.now(), 'IN->', id, code_buf[1].toString('utf8'))
-        setTimeout(() => {
-          res.writeHead(code_buf[0], {
-            'Content-Length': code_buf[1].length,
-            'Content-Type': 'application/json'
-          })
-          res.end(code_buf[1])
-        }, netdelay())
+  get id () {
+    return this._id
+  }
+
+  netdelay () {
+    return 500 * (Math.random() + 0.5)
+  }
+
+  server (handler) {
+    http.createServer((req, res) => {
+      let parts = []
+      let id = '#' + this._next_id++
+      req.on('data', part => parts.push(part))
+      req.on('end', () => {
+        let name = require('url').parse(req.url).pathname.replace(/\//g, '')
+        let json, outdata
+        new Promise((resolve, reject) => {
+          let text = Buffer.concat(parts).toString('utf8')
+          json = JSON.parse(text)
+          setTimeout(() => {
+            console.log(Date.now(), this.id, 'IN<-', json.FROM, id, name, json)
+            resolve(json)
+          }, this.netdelay())
+        }).then(json => handler(name, json)).then(
+          result => [200, new Buffer(JSON.stringify(outdata = result), 'utf8')],
+          error => [500, new Buffer((outdata = error).toString(), 'utf8')]
+        ).then(code_buf => {
+          console.log(Date.now(), this.id, 'IN->', json.FROM, id, outdata)
+          setTimeout(() => {
+            res.writeHead(code_buf[0], {
+              'Content-Length': code_buf[1].length,
+              'Content-Type': 'application/json'
+            })
+            res.end(code_buf[1])
+          }, this.netdelay())
+        })
       })
-    })
-  }).listen(port)
-}
+    }).listen(this._id)
+  }
 
-function rpcCall (port, name, args) {
-  let id = next_id++
-  console.log(Date.now(), 'OU->', id, name, JSON.stringify(args))
-  let prom = got.post(`http://localhost:${port}/${name}`,
-    { body: JSON.stringify(args) }).then(response => response.body)
+  call (dest, name, args) {
+    let id = '#' + this._next_id++
+    args.FROM = this.id
+    console.log(Date.now(), this.id, 'OU->', dest, id, name, args)
+    let prom = got.post(`http://localhost:${dest}/${name}`,
+      { body: JSON.stringify(args), json: true }).then(response => response.body)
 
-  prom.then(
-    result => console.log(Date.now(), 'OU<-', id, result),
-    error => console.log(Date.now(), 'OU<-', id, error.toString())
-  )
+    prom.then(
+      result => console.log(Date.now(), this.id, 'OU<-', dest, id, result),
+      error => console.log(Date.now(), this.id, 'OU<-', dest, id, error.message)
+    )
 
-  return prom
+    return prom
+  }
 }
 
 // for the purpose of this example, our payload is a set of strings keyed by a string
 // we track our present state, clocks?, peerings?
 class State {
-  constructor (id) {
-    this._id = id
+  constructor (rpc) {
+    this._rpc = rpc
+    this._id = rpc.id
     this._data = {}
     this._epoch = 0 // epoch 0 is ALWAYS empty
     this._clocks = {} // Not part of the cut, advisory only
@@ -65,6 +78,10 @@ class State {
     this._commitTimer = 0
     this._commitPromise = null
 
+    // sent can grow without bound currently.  FUTURE: fix that (it doesn't replicate so it's not so bad)
+    this._callbacksSent = {}
+    this._callbacksReceived = {}
+
     this._peers = {}
   }
 
@@ -72,14 +89,22 @@ class State {
     return this._id
   }
 
+  // TODO: since we rely on back-replication to invoke the callbacks, they fire one round trip too late when replicating down
   _commit () {
     let change = []
     let data_changed = false
+    let fire_callback = {}
     this._pending.forEach(pend => {
-      if ('epoch' in pend) {
+      if ('system' in pend) {
         if ((this._clocks[pend.system] || 0) >= pend.epoch) return
         change.push(pend)
         this._clocks[pend.system] = pend.epoch
+      } else if ('callback' in pend) {
+        if (this._callbacksSent[pend.callback] &&
+          this._callbacksSent[pend.callback] >= pend.epoch) return
+        if (fire_callback[pend.callback] &&
+          fire_callback[pend.callback].epoch >= pend.epoch) return
+        fire_callback[pend.callback] = pend
       } else {
         this._data[pend.key] = this._data[pend.key] || {}
         if (this._data[pend.key][pend.value]) return
@@ -93,7 +118,17 @@ class State {
       this._epoch++
       this._clocks[this.id] = this._epoch
       change.push({ system: this.id, epoch: this._epoch })
+      change.push({ callback: this.id, path: [], epoch: this._epoch })
     }
+    Object.keys(fire_callback).forEach(sys => {
+      let pend = fire_callback[sys]
+      this._callbacksSent[pend.callback] = pend.epoch
+      this._rpc.call(pend.path[0], 'callback', {
+        epoch: pend.epoch, into: this.id, into_epoch: this._epoch,
+        path: pend.path.slice(1)
+      })
+      change.push(pend)
+    })
     if (change.length) {
       Object.keys(this._peers).forEach(port => {
         if (this._peers[port].valid) {
@@ -119,7 +154,7 @@ class State {
   }
 
   rpc_hello (args) {
-    let port = args.port
+    let port = args.FROM
     if (this._peers[port]) {
       throw new Error('Already peered')
     }
@@ -138,7 +173,7 @@ class State {
   }
 
   rpc_connect (args) {
-    let port = args.port
+    let port = args.peer
     if (this._peers[port]) {
       throw new Error('Already peered')
     }
@@ -152,8 +187,8 @@ class State {
       sendQueue: this._dumpAll()
     }
 
-    return rpcCall(port, 'hello', {
-      port: this.id, passClocks: !!(args.clock & 2)
+    return this._rpc.call(port, 'hello', {
+      passClocks: !!(args.clock & 2)
     }).then(() => {
       this._peers[port].valid = true
       this._checkSendUpdate(port)
@@ -171,6 +206,9 @@ class State {
         outp.push({ key: key, value: value })
       })
     })
+    Object.keys(this._clocks).forEach(sys => {
+      outp.push({ system: sys, epoch: this._clocks[sys] })
+    })
     return outp
   }
 
@@ -184,8 +222,19 @@ class State {
     peer.sendQueue = []
     peer.sentEpoch = this._epoch
 
-    rpcCall(port, 'update', {
-      from_epoch: from_epoch, to_epoch: this._epoch, data: queue, port: this.id
+    if (!peer.passClocks) {
+      queue = queue.filter(qe => !('callback' in qe))
+    }
+    queue = queue.map(qe => {
+      if ('callback' in qe) {
+        // the callbacks should retrace the replication path
+        qe = { callback: qe.callback, path: [this.id].concat(qe.path), epoch: qe.epoch }
+      }
+      return qe
+    })
+
+    this._rpc.call(port, 'update', {
+      from_epoch: from_epoch, to_epoch: this._epoch, data: queue
     }).then(() => {
       peer.sending = false
       this._checkSendUpdate(port)
@@ -193,9 +242,9 @@ class State {
   }
 
   rpc_update (args) {
-    let peer = this._peers[args.port]
+    let peer = this._peers[args.FROM]
     args.data.forEach(item => {
-      if ('epoch' in item && !peer.passClocks) return
+      if ('system' in item && !peer.passClocks) return
       this._pending.push(item)
     })
     return this._commitSoon()
@@ -205,8 +254,33 @@ class State {
     return this._data[args.key] || {}
   }
 
+  rpc_callback (args) {
+    if (args.path.length > 0) {
+      return this._rpc.call(args.path[0], 'callback', {
+        epoch: args.epoch, into_epoch: args.into_epoch, into: args.into,
+        path: args.path.slice(1)
+      })
+    } else {
+      if (!this._callbacksReceived[args.into] ||
+        args.epoch >= this._callbacksReceived[args.into].epoch) {
+        this._callbacksReceived[args.into] = args
+      }
+      return null
+    }
+  }
+
   rpc_clocks (args) {
-    return this._clocks
+    let out = {}
+    Object.keys(this._clocks).forEach(sys => {
+      if (!out[sys]) out[sys] = {}
+      out[sys].i_have = this._clocks[sys]
+    })
+    Object.keys(this._callbacksReceived).forEach(sys => {
+      if (!out[sys]) out[sys] = {}
+      out[sys].they_have = this._callbacksReceived[sys].epoch
+      out[sys].they_have_in = this._callbacksReceived[sys].into_epoch
+    })
+    return out
   }
 
   rpc_put (args) {
@@ -217,9 +291,10 @@ class State {
   }
 }
 
-{
-  let state = new State(process.env.PORT)
-  rpcServer(state.id, (cmd, args) => {
+process.env.PORT.split(',').forEach(port => {
+  let rpc = new RPC(port)
+  let state = new State(rpc)
+  rpc.server((cmd, args) => {
     let fn = state[`rpc_${cmd}`]
     if (fn) {
       return fn.call(state, args)
@@ -227,4 +302,4 @@ class State {
       throw new Error('invalid command')
     }
   })
-}
+})

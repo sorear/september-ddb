@@ -12,5 +12,7 @@
     E. Rolling leases
 3. Design and implement sharding/replication for large subsystems.
 4. Reimplement in Rust
+4. Non-critical optimizations
+    A. Replicate data once over any given link
 4. User-RPCs; may require control plane work, but after that it's just barriers
 5. Views: acts like an RPC, but handles by the nearest subsystem with all the data
