@@ -1,0 +1,16 @@
+1. NodeJS PoC with HTTP RPCs and only persist-all nodes
+    A. RPC mockup
+    B. get/set
+    C. P2P replication
+    D. Vector clocks
+    E. Replication awareness
+2. Finish design of persist-some nodes (largest outstanding question: can we avoid sending the history?)
+    A. Generating partial updates
+    B. Accepting partial updates
+    C. Request-initiated fetching
+    D. Writeback
+    E. Rolling leases
+3. Design and implement sharding/replication for large subsystems.
+4. Reimplement in Rust
+4. User-RPCs; may require control plane work, but after that it's just barriers
+5. Views: acts like an RPC, but handles by the nearest subsystem with all the data
