@@ -59,6 +59,7 @@ class State {
     this._id = id
     this._data = {}
     this._epoch = 0 // epoch 0 is ALWAYS empty
+    this._clocks = {} // Not part of the cut, advisory only
 
     this._pending = []
     this._commitTimer = 0
@@ -72,17 +73,31 @@ class State {
   }
 
   _commit () {
-    this._epoch++
     let change = []
+    let data_changed = false
     this._pending.forEach(pend => {
-      this._data[pend.key] = this._data[pend.key] || {}
-      if (!this._data[pend.key][pend.value]) change.push(pend)
-      this._data[pend.key][pend.value] = true
+      if ('epoch' in pend) {
+        if ((this._clocks[pend.system] || 0) >= pend.epoch) return
+        change.push(pend)
+        this._clocks[pend.system] = pend.epoch
+      } else {
+        this._data[pend.key] = this._data[pend.key] || {}
+        if (this._data[pend.key][pend.value]) return
+        change.push(pend)
+        data_changed = true
+        this._data[pend.key][pend.value] = true
+      }
     })
+    if (data_changed) {
+      // merely learning new clock values does not create a new epoch, although it is replicated
+      this._epoch++
+      this._clocks[this.id] = this._epoch
+      change.push({ system: this.id, epoch: this._epoch })
+    }
     if (change.length) {
       Object.keys(this._peers).forEach(port => {
         if (this._peers[port].valid) {
-          change.forEach(pend => this._peers[port].sendqueue.push(pend))
+          change.forEach(pend => this._peers[port].sendQueue.push(pend))
           this._checkSendUpdate(port)
         }
       })
@@ -93,6 +108,7 @@ class State {
   }
 
   _commitSoon () {
+    if (!this._pending.length) return Promise.resolve(null)
     if (!this._commitTimer) {
       this._commitPromise = new Promise((resolve, reject) => {
         this._commitTimer = setTimeout(() => resolve(this._commit()),
@@ -112,8 +128,9 @@ class State {
       valid: true,
       port: port,
       sending: false,
-      sentepoch: 0,
-      sendqueue: this._dumpAll()
+      sentEpoch: 0,
+      passClocks: args.passClocks,
+      sendQueue: this._dumpAll()
     }
 
     this._checkSendUpdate(port)
@@ -129,12 +146,15 @@ class State {
     this._peers[port] = {
       valid: false,
       port: port,
+      passClocks: !!(args.clock & 1),
       sending: false,
-      sentepoch: 0,
-      sendqueue: this._dumpAll()
+      sentEpoch: 0,
+      sendQueue: this._dumpAll()
     }
 
-    return rpcCall(port, 'hello', { port: this.id }).then(() => {
+    return rpcCall(port, 'hello', {
+      port: this.id, passClocks: !!(args.clock & 2)
+    }).then(() => {
       this._peers[port].valid = true
       this._checkSendUpdate(port)
       return null
@@ -156,16 +176,16 @@ class State {
 
   _checkSendUpdate (port) {
     let peer = this._peers[port]
-    if (!peer || !peer.valid || peer.sending || !peer.sendqueue.length) return
-    let queue = peer.sendqueue
-    let from_epoch = peer.sentepoch
+    if (!peer || !peer.valid || peer.sending || !peer.sendQueue.length) return
+    let queue = peer.sendQueue
+    let from_epoch = peer.sentEpoch
 
     peer.sending = true
-    peer.sendqueue = []
-    peer.sentepoch = this._epoch
+    peer.sendQueue = []
+    peer.sentEpoch = this._epoch
 
     rpcCall(port, 'update', {
-      from_epoch: from_epoch, to_epoch: this._epoch, data: queue
+      from_epoch: from_epoch, to_epoch: this._epoch, data: queue, port: this.id
     }).then(() => {
       peer.sending = false
       this._checkSendUpdate(port)
@@ -173,14 +193,20 @@ class State {
   }
 
   rpc_update (args) {
+    let peer = this._peers[args.port]
     args.data.forEach(item => {
-      this._pending.push({ key: String(item.key), value: String(item.value) })
+      if ('epoch' in item && !peer.passClocks) return
+      this._pending.push(item)
     })
     return this._commitSoon()
   }
 
   rpc_get (args) {
     return this._data[args.key] || {}
+  }
+
+  rpc_clocks (args) {
+    return this._clocks
   }
 
   rpc_put (args) {
