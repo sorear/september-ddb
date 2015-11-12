@@ -70,7 +70,7 @@ class State {
   constructor (rpc) {
     this._rpc = rpc
     this._id = rpc.id
-    this._data = {}
+    this._data = new Map()
     this._epoch = 0 // epoch 0 is ALWAYS empty
     this._clocks = {} // Not part of the cut, advisory only
 
@@ -106,11 +106,11 @@ class State {
           fire_callback[pend.callback].epoch >= pend.epoch) return
         fire_callback[pend.callback] = pend
       } else {
-        this._data[pend.key] = this._data[pend.key] || {}
-        if (this._data[pend.key][pend.value]) return
+        if (!this._data.get(pend.key)) this._data.set(pend.key, new Set())
+        if (this._data.get(pend.key).has(pend.value)) return
         change.push(pend)
         data_changed = true
-        this._data[pend.key][pend.value] = true
+        this._data.get(pend.key).add(pend.value)
       }
     })
     if (data_changed) {
@@ -164,6 +164,8 @@ class State {
       port: port,
       sending: false,
       sentEpoch: 0,
+      sendFilter: args.filter ? this._makeFilter() : null,
+      sendFilterRequest: args.filter || [],
       passClocks: args.passClocks,
       sendQueue: this._dumpAll()
     }
@@ -178,17 +180,24 @@ class State {
       throw new Error('Already peered')
     }
 
+    if (args.filter && (args.clock & 2)) {
+      throw new Error('A partial replica cannot be a clock source')
+    }
+
     this._peers[port] = {
       valid: false,
       port: port,
       passClocks: !!(args.clock & 1),
       sending: false,
       sentEpoch: 0,
+      sendFilter: null,
+      sendFilterRequest: [],
       sendQueue: this._dumpAll()
     }
 
     return this._rpc.call(port, 'hello', {
-      passClocks: !!(args.clock & 2)
+      passClocks: !!(args.clock & 2),
+      filter: args.filter
     }).then(() => {
       this._peers[port].valid = true
       this._checkSendUpdate(port)
@@ -201,37 +210,84 @@ class State {
 
   _dumpAll () {
     let outp = []
-    Object.keys(this._data).forEach(key => {
-      Object.keys(this._data[key]).forEach(value => {
+    for (let key of this._data.keys()) {
+      for (let value of this._data.get(key)) {
         outp.push({ key: key, value: value })
-      })
-    })
+      }
+    }
     Object.keys(this._clocks).forEach(sys => {
       outp.push({ system: sys, epoch: this._clocks[sys] })
     })
     return outp
   }
 
+  _makeFilter () {
+    return {
+      prefixes: new Set(),
+      keys: new Set()
+    }
+  }
+
   _checkSendUpdate (port) {
     let peer = this._peers[port]
-    if (!peer || !peer.valid || peer.sending || !peer.sendQueue.length) return
+    if (!peer || !peer.valid || peer.sending ||
+      (!peer.sendQueue.length && !peer.sendFilterRequest.length)) return
     let queue = peer.sendQueue
     let from_epoch = peer.sentEpoch
+    let filter_changes = peer.sendFilterRequest
 
     peer.sending = true
     peer.sendQueue = []
+    peer.sendFilterRequest = []
     peer.sentEpoch = this._epoch
 
-    if (!peer.passClocks) {
-      queue = queue.filter(qe => !('callback' in qe))
+    for (let freq of filter_changes) {
+      if (!peer.sendFilter) peer.sendFilter = this._makeFilter()
+
+      if ('add_prefix' in freq) {
+        peer.sendFilter.prefixes.add(freq.add_prefix)
+        for (let key of this._data.keys()) {
+          if (!key.startsWith(freq.add_prefix)) continue
+          for (let value of this._data.get(key)) {
+            queue.push({ key: key, value: value })
+          }
+        }
+      } else if ('add_key' in freq) {
+        peer.sendFilter.keys.add(freq.add_key)
+        if (this._data.has(freq.add_key)) {
+          for (let value of this._data.get(freq.add_key)) {
+            queue.push({ key: freq.add_key, value: value })
+          }
+        }
+      } else {
+        throw new Error('unhandled filter change request')
+      }
     }
+
     queue = queue.map(qe => {
+      if (!peer.passClocks && 'callback' in qe) {
+        return null
+      }
+      if ('key' in qe && peer.sendFilter) {
+        let ok = peer.sendFilter.keys.has(qe.key)
+        for (let pfx of peer.sendFilter.prefixes) {
+          if (qe.key.startsWith(pfx)) ok = true
+        }
+        if (!ok) return null
+      }
       if ('callback' in qe) {
         // the callbacks should retrace the replication path
         qe = { callback: qe.callback, path: [this.id].concat(qe.path), epoch: qe.epoch }
       }
       return qe
-    })
+    }).filter(qe => qe)
+
+    if (peer.sendFilter) {
+      queue.push({
+        baseline: { system: this.id, epoch: this._epoch },
+        filterChanges: filter_changes
+      })
+    }
 
     this._rpc.call(port, 'update', {
       from_epoch: from_epoch, to_epoch: this._epoch, data: queue
@@ -245,13 +301,14 @@ class State {
     let peer = this._peers[args.FROM]
     args.data.forEach(item => {
       if ('system' in item && !peer.passClocks) return
+      if ('baseline' in item) throw new Error('Receiving filtered updates not supported')
       this._pending.push(item)
     })
     return this._commitSoon()
   }
 
   rpc_get (args) {
-    return this._data[args.key] || {}
+    return Array.from(this._data.get(args.key) || new Set())
   }
 
   rpc_callback (args) {
