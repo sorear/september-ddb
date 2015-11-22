@@ -82,6 +82,7 @@ class State {
     this._callbacksReceived = {}
 
     this._peers = {}
+    this._basePeer = null
   }
 
   get id () {
@@ -93,8 +94,47 @@ class State {
     let clock_updates = []
     let data_updates = []
     let fire_callback = {}
+    let base_changed = false
 
     for (let update of pending) {
+      let peer = update.peer // may be null for non-update events
+      if (peer && peer.failedReplication) {
+        update.reject(update.peer.failedReplication)
+        continue
+      }
+
+      if (update.base) {
+        if (update.base.system === this.id) {
+          // someone updating based on us.  OK
+        } else if (update.base.system === peer.port && peer === this._basePeer) {
+          if (update.base.epoch > peer.baseEpoch) {
+            peer.baseEpoch = update.base.epoch
+            base_changed = true
+          }
+
+          if (update.filterChanges) {
+            let filter = peer.receivingFilter
+            if (!filter) {
+              filter = peer.receivingFilter = {
+                points: [],
+                prefixes: []
+              }
+            }
+
+            if (update.filterChanges.addPoints) {
+              filter.points = filter.points.concat(update.filterChanges.addPoints)
+            }
+
+            if (update.filterChanges.addPrefixes) {
+              filter.prefixes = filter.points.concat(update.filterChanges.addPrefixes)
+            }
+          }
+        } else {
+          update.reject(update.peer.failedReplication = 'unexpected base')
+          continue
+        }
+      }
+
       for (let clock_up of update.clocks_included || []) {
         if ((this._clocks[clock_up.system] || 0) >= clock_up.epoch) continue
         clock_updates.push(clock_up)
@@ -115,20 +155,18 @@ class State {
         data_updates.push(item)
         this._data.get(item.key).add(item.value)
       }
+
+      update.resolve(null) // can't actually fire until after the epoch bump below ...
     }
 
     let forward_callbacks = []
 
-    if (data_updates.length) {
+    if (base_changed || data_updates.length) {
       // merely learning new clock values does not create a new epoch, although it is replicated
       this._epoch++
       this._clocks[this.id] = this._epoch
       clock_updates.push({ system: this.id, epoch: this._epoch })
       forward_callbacks.push({ target: this.id, path: [], epoch: this._epoch })
-    }
-
-    for (let update of pending) {
-      update.resolve(null)
     }
 
     for (let sys in fire_callback) {
@@ -141,10 +179,15 @@ class State {
       forward_callbacks.push(pending_callback)
     }
 
-    if (forward_callbacks.length || data_updates.length || clock_updates.length) {
+    if (base_changed || forward_callbacks.length || data_updates.length || clock_updates.length) {
       for (let port in this._peers) {
         let peer = this._peers[port]
+        if (this._basePeer && peer !== this._basePeer) {
+          throw "don't know how to replicate down from a cache"
+        }
+
         peer.sendQueue.push({
+          base: peer.sendingFilter ? { system: this.id, epoch: this._epoch } : null,
           data: data_updates.filter(upd => this._keyMatchesFilter(upd.key, peer.sendingFilter)),
           clocks_included: peer.isClockSource ? [] : clock_updates,
           // the callbacks should retrace the replication path
@@ -182,6 +225,10 @@ class State {
       throw new Error('Already peered')
     }
 
+    if (this._basePeer) {
+      throw "don't know how to replicate from a cache"
+    }
+
     let peer = this._peers[port] = {
       cork: false,
       port: port,
@@ -189,6 +236,7 @@ class State {
       sending: false,
       sendingFilter: args.filter,
       receivingFilter: null,
+      failedReplication: null,
       sendQueue: [this._dumpAll(args.filter)]
     }
 
@@ -206,6 +254,10 @@ class State {
       throw new Error('A partial replica cannot be a clock source')
     }
 
+    if (this._basePeer) {
+      throw "don't know how to replicate from a cache"
+    }
+
     let peer = this._peers[port] = {
       cork: true, // don't send updates until they have acked the Hello
       port: port,
@@ -213,7 +265,12 @@ class State {
       sending: false,
       sendingFilter: null,
       receivingFilter: null,
+      failedReplication: null,
       sendQueue: [this._dumpAll(null)]
+    }
+
+    if (args.filter) {
+      this._basePeer = peer
     }
 
     return this._rpc.call(port, 'hello', {
@@ -224,7 +281,12 @@ class State {
       this._checkSendUpdate(peer)
       return null
     }, e => {
-      delete this._peers[port]
+      if (this._basePeer === peer) {
+        this._basePeer = null
+      }
+      if (this._peers[port] === peer) {
+        delete this._peers[port]
+      }
       throw e
     })
   }
@@ -283,6 +345,10 @@ class State {
   }
 
   rpc_get (args) {
+    if (this._basePeer && !this._keyMatchesFilter(args.key, this._basePeer.receivingFilter)) {
+      throw "don't know how to get from a cache"
+    }
+
     return Array.from(this._data.get(args.key) || new Set())
   }
 
