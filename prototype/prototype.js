@@ -145,7 +145,7 @@ class State {
       for (let port in this._peers) {
         let peer = this._peers[port]
         peer.sendQueue.push({
-          data: data_updates,
+          data: data_updates.filter(upd => this._keyMatchesFilter(upd.key, peer.sendingFilter)),
           clocks_included: peer.isClockSource ? [] : clock_updates,
           // the callbacks should retrace the replication path
           callbacks: peer.isClockSource ? forward_callbacks.map(qe => {
@@ -187,7 +187,9 @@ class State {
       port: port,
       isClockSource: args.isClockSource,
       sending: false,
-      sendQueue: [this._dumpAll()]
+      sendingFilter: args.filter,
+      receivingFilter: null,
+      sendQueue: [this._dumpAll(args.filter)]
     }
 
     this._checkSendUpdate(peer)
@@ -209,7 +211,9 @@ class State {
       port: port,
       isClockSource: !!args.isClockSource,
       sending: false,
-      sendQueue: [this._dumpAll()]
+      sendingFilter: null,
+      receivingFilter: null,
+      sendQueue: [this._dumpAll(null)]
     }
 
     return this._rpc.call(port, 'hello', {
@@ -225,27 +229,32 @@ class State {
     })
   }
 
-  _dumpAll () {
+  _keyMatchesFilter (key, filter) {
+    return !filter || filter.points.indexOf(key) >= 0 || filter.prefixes.some(prefix => key.startsWith(prefix))
+  }
+
+  _dumpAll (filter) {
     let data = []
     let clocks = []
     for (let key of this._data.keys()) {
+      if (!this._keyMatchesFilter(key, filter)) {
+        continue
+      }
       for (let value of this._data.get(key)) {
         data.push({ key: key, value: value })
       }
     }
-    Object.keys(this._clocks).forEach(sys => {
+    for (let sys in this._clocks) {
       clocks.push({ system: sys, epoch: this._clocks[sys] })
-    })
+    }
     return {
+      base: filter ? { system: this.id, epoch: this._epoch } : null,
+      filterChanges: filter ? {
+        addPoints: filter.points,
+        addPrefixes: filter.prefixes
+      } : null,
       data: data,
       clock_updates: clocks
-    }
-  }
-
-  _makeFilter () {
-    return {
-      prefixes: new Set(),
-      keys: new Set()
     }
   }
 
@@ -265,7 +274,9 @@ class State {
   }
 
   rpc_update (args) {
+    let peer = this._peers[args.FROM]
     for (let epoch of args.updates) {
+      epoch.peer = peer
       this._nominate(epoch)
     }
     return null // just queueing
