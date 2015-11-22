@@ -28,14 +28,14 @@ class RPC {
           let text = Buffer.concat(parts).toString('utf8')
           json = JSON.parse(text)
           setTimeout(() => {
-            console.log(Date.now(), this.id, 'IN<-', json.FROM, id, name, json)
+            console.log('%d %d IN<- %s %s %s %s', Date.now(), this.id, json.FROM, id, name, JSON.stringify(json, null, 2))
             resolve(json)
           }, this.netdelay())
         }).then(json => handler(name, json)).then(
-          result => [200, new Buffer(JSON.stringify(outdata = result), 'utf8')],
-          error => [500, new Buffer((outdata = error).toString(), 'utf8')]
+          result => [200, new Buffer(JSON.stringify(outdata = result, null, 2) + '\n', 'utf8')],
+          error => [500, new Buffer(JSON.stringify(outdata = (error instanceof Error ? error.toString() : error), null, 2) + '\n', 'utf8')]
         ).then(code_buf => {
-          console.log(Date.now(), this.id, 'IN->', json.FROM, id, outdata)
+          console.log('%d %d IN-> %s %s %s', Date.now(), this.id, json.FROM, id, JSON.stringify(outdata, null, 2))
           setTimeout(() => {
             res.writeHead(code_buf[0], {
               'Content-Length': code_buf[1].length,
@@ -51,13 +51,13 @@ class RPC {
   call (dest, name, args) {
     let id = '#' + this._next_id++
     args.FROM = this.id
-    console.log(Date.now(), this.id, 'OU->', dest, id, name, args)
+    console.log('%s %s OU-> %s %s %s %s', Date.now(), this.id, dest, id, name, JSON.stringify(args, null, 2))
     let prom = got.post(`http://localhost:${dest}/${name}`,
-      { body: JSON.stringify(args), json: true }).then(response => response.body)
+      { body: JSON.stringify(args, null, 2), json: true }).then(response => response.body, err => { throw err.response.body })
 
     prom.then(
-      result => console.log(Date.now(), this.id, 'OU<-', dest, id, result),
-      error => console.log(Date.now(), this.id, 'OU<-', dest, id, error.message)
+      result => console.log('%s %s OU<- %s %s %s', Date.now(), this.id, dest, id, JSON.stringify(result, null, 2)),
+      error => console.log('%s %s OU<- %s %s %s', Date.now(), this.id, dest, id, error.message)
     )
 
     return prom
@@ -76,7 +76,6 @@ class State {
 
     this._pending = []
     this._commitTimer = 0
-    this._commitPromise = null
 
     // sent can grow without bound currently.  FUTURE: fix that (it doesn't replicate so it's not so bad)
     this._callbacksSent = {}
@@ -90,67 +89,91 @@ class State {
   }
 
   // TODO: since we rely on back-replication to invoke the callbacks, they fire one round trip too late when replicating down
-  _commit () {
-    let change = []
-    let data_changed = false
+  _commit (pending) {
+    let clock_updates = []
+    let data_updates = []
     let fire_callback = {}
-    this._pending.forEach(pend => {
-      if ('system' in pend) {
-        if ((this._clocks[pend.system] || 0) >= pend.epoch) return
-        change.push(pend)
-        this._clocks[pend.system] = pend.epoch
-      } else if ('callback' in pend) {
-        if (this._callbacksSent[pend.callback] &&
-          this._callbacksSent[pend.callback] >= pend.epoch) return
-        if (fire_callback[pend.callback] &&
-          fire_callback[pend.callback].epoch >= pend.epoch) return
-        fire_callback[pend.callback] = pend
-      } else {
-        if (!this._data.get(pend.key)) this._data.set(pend.key, new Set())
-        if (this._data.get(pend.key).has(pend.value)) return
-        change.push(pend)
-        data_changed = true
-        this._data.get(pend.key).add(pend.value)
+
+    for (let update of pending) {
+      for (let clock_up of update.clocks_included || []) {
+        if ((this._clocks[clock_up.system] || 0) >= clock_up.epoch) continue
+        clock_updates.push(clock_up)
+        this._clocks[clock_up.system] = clock_up.epoch
       }
-    })
-    if (data_changed) {
+
+      for (let callback of update.callbacks || []) {
+        if (this._callbacksSent[callback.target] &&
+          this._callbacksSent[callback.target] >= callback.epoch) continue
+        if (fire_callback[callback.target] &&
+          fire_callback[callback.target].epoch >= callback.epoch) continue
+        fire_callback[callback.target] = callback
+      }
+
+      for (let item of update.data || []) {
+        if (!this._data.get(item.key)) this._data.set(item.key, new Set())
+        if (this._data.get(item.key).has(item.value)) continue
+        data_updates.push(item)
+        this._data.get(item.key).add(item.value)
+      }
+    }
+
+    let forward_callbacks = []
+
+    if (data_updates.length) {
       // merely learning new clock values does not create a new epoch, although it is replicated
       this._epoch++
       this._clocks[this.id] = this._epoch
-      change.push({ system: this.id, epoch: this._epoch })
-      change.push({ callback: this.id, path: [], epoch: this._epoch })
+      clock_updates.push({ system: this.id, epoch: this._epoch })
+      forward_callbacks.push({ target: this.id, path: [], epoch: this._epoch })
     }
-    Object.keys(fire_callback).forEach(sys => {
-      let pend = fire_callback[sys]
-      this._callbacksSent[pend.callback] = pend.epoch
-      this._rpc.call(pend.path[0], 'callback', {
-        epoch: pend.epoch, into: this.id, into_epoch: this._epoch,
-        path: pend.path.slice(1)
-      })
-      change.push(pend)
-    })
-    if (change.length) {
-      Object.keys(this._peers).forEach(port => {
-        if (this._peers[port].valid) {
-          change.forEach(pend => this._peers[port].sendQueue.push(pend))
-          this._checkSendUpdate(port)
-        }
-      })
+
+    for (let update of pending) {
+      update.resolve(null)
     }
-    this._pending = []
-    this._commitTimer = 0
-    return null
+
+    for (let sys in fire_callback) {
+      let pending_callback = fire_callback[sys]
+      this._callbacksSent[pending_callback.target] = pending_callback.epoch
+      this._rpc.call(pending_callback.path[0], 'callback', {
+        epoch: pending_callback.epoch, into: this.id, into_epoch: this._epoch,
+        path: pending_callback.path.slice(1)
+      })
+      forward_callbacks.push(pending_callback)
+    }
+
+    if (forward_callbacks.length || data_updates.length || clock_updates.length) {
+      for (let port in this._peers) {
+        let peer = this._peers[port]
+        peer.sendQueue.push({
+          data: data_updates,
+          clocks_included: peer.isClockSource ? [] : clock_updates,
+          // the callbacks should retrace the replication path
+          callbacks: peer.isClockSource ? forward_callbacks.map(qe => {
+            return { target: qe.target, path: [this.id].concat(qe.path), epoch: qe.epoch }
+          }) : []
+        })
+        this._checkSendUpdate(peer)
+      }
+    }
   }
 
-  _commitSoon () {
-    if (!this._pending.length) return Promise.resolve(null)
-    if (!this._commitTimer) {
-      this._commitPromise = new Promise((resolve, reject) => {
-        this._commitTimer = setTimeout(() => resolve(this._commit()),
-          200 * (Math.random() + 1))
-      })
+  // implements nomination/arbiter process
+  // will take ownership of object and inject resolve() and reject() methods
+  _nominate (obj) {
+    let promise = new Promise((resolve, reject) => {
+      obj.resolve = resolve
+      obj.reject = reject
+    })
+    this._pending.push(obj)
+    if (this._pending.length === 1) {
+      this._commitTimer = setTimeout(() => {
+        this._commitTimer = 0
+        let pending = this._pending
+        this._pending = []
+        this._commit(pending)
+      }, 200 * (Math.random() + 1))
     }
-    return this._commitPromise
+    return promise
   }
 
   rpc_hello (args) {
@@ -159,18 +182,15 @@ class State {
       throw new Error('Already peered')
     }
 
-    this._peers[port] = {
-      valid: true,
+    let peer = this._peers[port] = {
+      cork: false,
       port: port,
+      isClockSource: args.isClockSource,
       sending: false,
-      sentEpoch: 0,
-      sendFilter: args.filter ? this._makeFilter() : null,
-      sendFilterRequest: args.filter || [],
-      passClocks: args.passClocks,
-      sendQueue: this._dumpAll()
+      sendQueue: [this._dumpAll()]
     }
 
-    this._checkSendUpdate(port)
+    this._checkSendUpdate(peer)
     return null
   }
 
@@ -180,27 +200,24 @@ class State {
       throw new Error('Already peered')
     }
 
-    if (args.filter && (args.clock & 2)) {
+    if (args.filter && args.isClockSink) {
       throw new Error('A partial replica cannot be a clock source')
     }
 
-    this._peers[port] = {
-      valid: false,
+    let peer = this._peers[port] = {
+      cork: true, // don't send updates until they have acked the Hello
       port: port,
-      passClocks: !!(args.clock & 1),
+      isClockSource: !!args.isClockSource,
       sending: false,
-      sentEpoch: 0,
-      sendFilter: null,
-      sendFilterRequest: [],
-      sendQueue: this._dumpAll()
+      sendQueue: [this._dumpAll()]
     }
 
     return this._rpc.call(port, 'hello', {
-      passClocks: !!(args.clock & 2),
+      isClockSource: !!args.isClockSink,
       filter: args.filter
     }).then(() => {
-      this._peers[port].valid = true
-      this._checkSendUpdate(port)
+      peer.cork = false
+      this._checkSendUpdate(peer)
       return null
     }, e => {
       delete this._peers[port]
@@ -209,16 +226,20 @@ class State {
   }
 
   _dumpAll () {
-    let outp = []
+    let data = []
+    let clocks = []
     for (let key of this._data.keys()) {
       for (let value of this._data.get(key)) {
-        outp.push({ key: key, value: value })
+        data.push({ key: key, value: value })
       }
     }
     Object.keys(this._clocks).forEach(sys => {
-      outp.push({ system: sys, epoch: this._clocks[sys] })
+      clocks.push({ system: sys, epoch: this._clocks[sys] })
     })
-    return outp
+    return {
+      data: data,
+      clock_updates: clocks
+    }
   }
 
   _makeFilter () {
@@ -228,83 +249,26 @@ class State {
     }
   }
 
-  _checkSendUpdate (port) {
-    let peer = this._peers[port]
-    if (!peer || !peer.valid || peer.sending ||
-      (!peer.sendQueue.length && !peer.sendFilterRequest.length)) return
-    let queue = peer.sendQueue
-    let from_epoch = peer.sentEpoch
-    let filter_changes = peer.sendFilterRequest
+  _checkSendUpdate (peer) {
+    if (peer.cork || peer.sending || !peer.sendQueue.length) return
+    let updates = peer.sendQueue
 
     peer.sending = true
     peer.sendQueue = []
-    peer.sendFilterRequest = []
-    peer.sentEpoch = this._epoch
 
-    for (let freq of filter_changes) {
-      if (!peer.sendFilter) peer.sendFilter = this._makeFilter()
-
-      if ('add_prefix' in freq) {
-        peer.sendFilter.prefixes.add(freq.add_prefix)
-        for (let key of this._data.keys()) {
-          if (!key.startsWith(freq.add_prefix)) continue
-          for (let value of this._data.get(key)) {
-            queue.push({ key: key, value: value })
-          }
-        }
-      } else if ('add_key' in freq) {
-        peer.sendFilter.keys.add(freq.add_key)
-        if (this._data.has(freq.add_key)) {
-          for (let value of this._data.get(freq.add_key)) {
-            queue.push({ key: freq.add_key, value: value })
-          }
-        }
-      } else {
-        throw new Error('unhandled filter change request')
-      }
-    }
-
-    queue = queue.map(qe => {
-      if (!peer.passClocks && 'callback' in qe) {
-        return null
-      }
-      if ('key' in qe && peer.sendFilter) {
-        let ok = peer.sendFilter.keys.has(qe.key)
-        for (let pfx of peer.sendFilter.prefixes) {
-          if (qe.key.startsWith(pfx)) ok = true
-        }
-        if (!ok) return null
-      }
-      if ('callback' in qe) {
-        // the callbacks should retrace the replication path
-        qe = { callback: qe.callback, path: [this.id].concat(qe.path), epoch: qe.epoch }
-      }
-      return qe
-    }).filter(qe => qe)
-
-    if (peer.sendFilter) {
-      queue.push({
-        baseline: { system: this.id, epoch: this._epoch },
-        filterChanges: filter_changes
-      })
-    }
-
-    this._rpc.call(port, 'update', {
-      from_epoch: from_epoch, to_epoch: this._epoch, data: queue
+    this._rpc.call(peer.port, 'update', {
+      updates
     }).then(() => {
       peer.sending = false
-      this._checkSendUpdate(port)
+      this._checkSendUpdate(peer)
     })
   }
 
   rpc_update (args) {
-    let peer = this._peers[args.FROM]
-    args.data.forEach(item => {
-      if ('system' in item && !peer.passClocks) return
-      if ('baseline' in item) throw new Error('Receiving filtered updates not supported')
-      this._pending.push(item)
-    })
-    return this._commitSoon()
+    for (let epoch of args.updates) {
+      this._nominate(epoch)
+    }
+    return null // just queueing
   }
 
   rpc_get (args) {
@@ -328,23 +292,24 @@ class State {
 
   rpc_clocks (args) {
     let out = {}
-    Object.keys(this._clocks).forEach(sys => {
+    for (let sys in this._clocks) {
       if (!out[sys]) out[sys] = {}
       out[sys].i_have = this._clocks[sys]
-    })
-    Object.keys(this._callbacksReceived).forEach(sys => {
+    }
+    for (let sys in this._callbacksReceived) {
       if (!out[sys]) out[sys] = {}
       out[sys].they_have = this._callbacksReceived[sys].epoch
       out[sys].they_have_in = this._callbacksReceived[sys].into_epoch
-    })
+    }
     return out
   }
 
   rpc_put (args) {
+    let data = []
     args.data.forEach(item => {
-      this._pending.push({ key: String(item.key), value: String(item.value) })
+      data.push({ key: String(item.key), value: String(item.value) })
     })
-    return this._commitSoon()
+    return this._nominate({ type: 'put', data }) // here we do want to wait, RYW
   }
 }
 
