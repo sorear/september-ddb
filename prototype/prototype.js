@@ -6,6 +6,7 @@ class RPC {
   constructor (id) {
     this._id = id
     this._next_id = 1
+    this._readyp = new Map()
   }
 
   get id () {
@@ -62,374 +63,247 @@ class RPC {
 
     return prom
   }
-}
 
-class DMap extends Map {
-  constructor (deffn) {
-    super()
-    this._default = deffn
-  }
+  qcall (dest, name, args) {
+    let ready = this._readyp.get(dest) || Promise.resolve(null)
+    let clearNext
+    let newReady = new Promise((resolve, reject) => clearNext = resolve)
+    this._readyp.set(dest, newReady)
 
-  open (key) {
-    if (this.has(key)) {
-      return this.get(key)
-    }
-    let nval = (this._default)()
-    this.set(key, nval)
-    return nval
-  }
-
-  fetch (key) {
-    return this.has(key) ? this.get(key) : (this._default)()
+    return ready.then(() => {
+      let done = this.call(dest, name, args)
+      done.catch(() => 0).then(() => {
+        clearNext()
+        if (this._readyp.get(dest) === newReady) {
+          this._readyp.delete(dest)
+        }
+      })
+      return done
+    })
   }
 }
 
-// for the purpose of this example, our payload is a set of strings keyed by a string
-// we track our present state, clocks?, peerings?
+function mapSet (map, key, val) {
+  if (val === undefined) {
+    map.delete(key)
+  } else {
+    map.set(key, val)
+  }
+}
+
+function deepEqual (a, b) {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+class Binding {
+}
+
 class State {
   constructor (rpc) {
-    // relevant to the cut
-    this._id = rpc.id
-    this._epoch = 0 // epoch 0 is ALWAYS empty
-    this._version = 0
-    this._clocks = {}
-    // modifying _clocks changes _epoch but not _version
-
-    this._urdata = new DMap(() => new Map())
-    this._baseIndices = new Map()
-    this._ourIndices = new Map()
-
-    // not relevant to the cut
     this._rpc = rpc
-    this._pending = []
-    this._commitTimer = 0
+    this._binding = new Binding()
 
-    // sent can grow without bound currently.  FUTURE: fix that (it doesn't replicate so it's not so bad)
-    this._callbacksSent = {}
-    this._callbacksReceived = {}
+    // # Last epoch number
+    this._epoch = 1
+    this._epochTimer = 0
 
-    this._peers = {}
-    this._basePeer = null
+    // # Upstream control
+    // ID of upstream, if any
+    this._upId = null
+    // Last upstream epoch which is known to us
+    this._upEpoch = 0
+    // Upstream-exposed index values, map from name to (opaque)
+    this._upIndices = new Map()
+
+    // # Causal state management
+    // For simplicity we maintain a fiction that data keys and index keys are independent.
+    // For the prototype much of the complexity can be shoveled off to the data/index mapping.
+    //
+    // Map from data keys to (opaque) values
+    this._data = new Map()
+    // Map from data keys to epochs, so that they can be removed when the upstream catches up
+    this._dataEpoch = new Map()
+
+    // Incoming updates from upstream
+    // { containsTo: 5, index: [{"key": 5}, {"key": 6, "value": 2}] }
+    this._upQueue = []
+    // Incoming updates from downstream
+    // { id: 1, epoch: 17, data: [{"key": "A", "value": 1}] }
+    this._downQueue = []
+    this._injectQueue = []
+
+    // Map of index keys to opaque values
+    this._myIndices = new Map()
+
+    // map of IDs to { id: 15, want: Set(...) }
+    this._downstreams = new Map()
   }
 
-  get id () {
-    return this._id
-  }
+  newEpoch () {
+    let datas_changed = new Set()
+    let upindex_changed = new Set()
+    let myindex_changed = new Set()
+    let down_maxindex = new Map()
 
-  // TODO: since we rely on back-replication to invoke the callbacks, they fire one round trip too late when replicating down
-  _commit (pending) {
-    let clock_updates = []
-    let data_updates = []
-    let fire_callback = {}
-    let new_version = false
+    let new_epoch = ++this._epoch
 
-    this._epoch++
-
-    for (let update of pending) {
-      let peer = update.peer // may be null for non-update events
-      if (peer && peer.failedReplication) {
-        update.reject(update.peer.failedReplication)
-        continue
-      }
-
-      if (update.base) {
-        if (update.base.system === this.id) {
-          // someone updating based on us.  OK
-        } else if (update.base.system === peer.port && peer === this._basePeer) {
-          // someone thinks we're their downstream
-          if (update.base.epoch > peer.baseEpoch) {
-            peer.baseEpoch = update.base.epoch
-            new_version = true
-          }
-
-          if (update.filterChanges) {
-            let filter = peer.receivingFilter
-            if (!filter) {
-              filter = peer.receivingFilter = {
-                points: [],
-                prefixes: []
-              }
-            }
-
-            if (update.filterChanges.addPoints) {
-              filter.points = filter.points.concat(update.filterChanges.addPoints)
-            }
-
-            if (update.filterChanges.addPrefixes) {
-              filter.prefixes = filter.points.concat(update.filterChanges.addPrefixes)
-            }
-          }
-        } else {
-          update.reject(update.peer.failedReplication = 'unexpected base')
-          continue
+    // incorporate index changes from above
+    for (let upo of this._upQueue.splice()) {
+      for (let ent of this._dataEpoch) {
+        if (ent[1] <= upo.containsTo) {
+          this._dataEpoch.delete(ent[0])
+          this._data.delete(ent[0])
+          datas_changed.add(ent[0])
         }
       }
 
-      for (let clock_up of update.clocks_included || []) {
-        if ((this._clocks[clock_up.system] || 0) >= clock_up.epoch) continue
-        clock_updates.push(clock_up)
-        this._clocks[clock_up.system] = clock_up.epoch
+      for (let ixent of upo.index) {
+        let prev = this._upIndices.get(ixent.key)
+        if (!deepEqual(prev, ixent.value)) {
+          upindex_changed.add(ixent.key)
+          mapSet(this._upIndices, ixent.key, ixent.value)
+        }
+      }
+    }
+
+    // incorporate data changes from below
+    for (let dno of this._downQueue.splice()) {
+      if (!down_maxindex.has(dno.id)) {
+        down_maxindex.set(dno.id, 0)
       }
 
-      for (let callback of update.callbacks || []) {
-        if (this._callbacksSent[callback.target] &&
-          this._callbacksSent[callback.target] >= callback.epoch) continue
-        if (fire_callback[callback.target] &&
-          fire_callback[callback.target].epoch >= callback.epoch) continue
-        fire_callback[callback.target] = callback
+      down_maxindex.set(dno.id, Math.max(down_maxindex.get(dno.id), dno.epoch))
+
+      for (let daent of dno.data) {
+        let prev = this._data.get(daent.key)
+        let next = this._binding.lubData(prev, daent.value)
+
+        if (!deepEqual(prev, next)) {
+          this._data.set(daent.key, next)
+          this._dataEpoch.set(daent.key, new_epoch)
+          datas_changed.add(daent.key)
+        }
+      }
+    }
+
+    // incorporate injected changes
+    let injected_callbacks = []
+    for (let dno of this._injectQueue.splice()) {
+      injected_callbacks.push(dno.callback)
+
+      for (let daent of dno.data) {
+        let prev = this._data.get(daent.key)
+        let next = this._binding.lubData(prev, daent.value)
+
+        if (!deepEqual(prev, next)) {
+          this._data.set(daent.key, next)
+          this._dataEpoch.set(daent.key, new_epoch)
+          datas_changed.add(daent.key)
+        }
+      }
+    }
+
+    // HERE sibling messages
+
+    // calculate changes to our index values
+    for (let ixkey of this._myIndices.keys()) {
+      let recalc = this._binding.calculateIndex(this, ixkey)
+      if (JSON.stringify(recalc) !== JSON.stringify(this._myIndices.get(ixkey))) {
+        mapSet(this._myIndices, ixkey, recalc)
+        myindex_changed.add(ixkey)
+      }
+    }
+
+    // pass index changes down
+    for (let ds of this._downstreams.values()) {
+      let msg = {
+        containsTo: down_maxindex.get(ds.id) || 0,
+        index: []
       }
 
-      // only for not-the-base
-      for (let item of update.urdata || []) {
-        let schema_bucket = this._urdata.open(item.schema)
-        let key_bucket = schema_bucket.open(item.key)
-        if (TypedData.updateUr(key_bucket, item.delta)) {
-          key_bucket.stamp = this._epoch + 1
-          data_updates.push(item)
-          new_version = true
+      for (let ixkey of myindex_changed) {
+        if (ds.want.has(ixkey)) {
+          msg.index.push({ key: ixkey, value: this._myIndices.get(ixkey) })
         }
       }
 
-      // only for the base
-      for (let item of update.cachedata || []) {
-        let index_bucket = this._cachedata.open(item.index)
-        let key_bucket = index_bucket.open(item.key)
+      this._rpc.qcall(ds.id, 'replicate_down', { msg })
+    }
 
+    // pass data changes up
+    if (this._upId) {
+      let msg = {
+        id: this._rpc.id,
+        epoch: new_epoch,
+        data: []
       }
 
-      update.resolve(null) // can't actually fire until the dust is settled
-    }
-
-    let forward_callbacks = []
-
-    if (new_version) {
-      // merely learning new clock values does not create a new version, although it is replicated
-      this._version = this._epoch
-      this._clocks[this.id] = this._epoch
-      clock_updates.push({ system: this.id, epoch: this._epoch })
-      forward_callbacks.push({ target: this.id, path: [], epoch: this._epoch })
-    }
-
-    for (let sys in fire_callback) {
-      let pending_callback = fire_callback[sys]
-      this._callbacksSent[pending_callback.target] = pending_callback.epoch
-      this._rpc.call(pending_callback.path[0], 'callback', {
-        epoch: pending_callback.epoch, into: this.id, into_epoch: this._version,
-        path: pending_callback.path.slice(1)
-      })
-      forward_callbacks.push(pending_callback)
-    }
-
-    for (let port in this._peers) {
-      let peer = this._peers[port]
-      if (this._basePeer && peer !== this._basePeer) {
-        throw "don't know how to replicate down from a cache"
+      for (let dkey of datas_changed) {
+        let dval = this._data.get(dkey)
+        if (dval !== undefined) {
+          msg.data.push({ key: dkey, value: dval })
+        }
       }
 
-      let message = {
-        base: peer.sendingFilter ? { system: this.id, epoch: this._epoch } : null,
-        data: data_updates.filter(upd => this._keyMatchesFilter(upd.key, peer.sendingFilter)),
-        clocks_included: peer.isClockSource ? [] : clock_updates,
-        // the callbacks should retrace the replication path
-        callbacks: peer.isClockSource ? forward_callbacks.map(qe => {
-          return { target: qe.target, path: [this.id].concat(qe.path), epoch: qe.epoch }
-        }) : []
-      }
+      this._rpc.qcall(this._upId, 'replicate_up', { msg })
+    }
 
-      if (message.base || message.data.length || message.clocks_included.length || message.callbacks.length) {
-        peer.sendQueue.push(message)
-        this._checkSendUpdate(peer)
-      }
+    // pass to callbacks
+    for (let cb of injected_callbacks) {
+      cb()
     }
   }
 
-  // implements nomination/arbiter process
-  // will take ownership of object and inject resolve() and reject() methods
-  _nominate (obj) {
-    let promise = new Promise((resolve, reject) => {
-      obj.resolve = resolve
-      obj.reject = reject
-    })
-    this._pending.push(obj)
-    if (this._pending.length === 1) {
-      this._commitTimer = setTimeout(() => {
-        this._commitTimer = 0
-        let pending = this._pending
-        this._pending = []
-        this._commit(pending)
-      }, 200 * (Math.random() + 1))
-    }
-    return promise
-  }
-
-  rpc_hello (args) {
-    let port = args.FROM
-    if (this._peers[port]) {
-      throw new Error('Already peered')
-    }
-
-    if (this._basePeer) {
-      throw "don't know how to replicate from a cache"
-    }
-
-    let peer = this._peers[port] = {
-      cork: false,
-      port: port,
-      isClockSource: args.isClockSource,
-      sending: false,
-      sendingFilter: args.filter,
-      receivingFilter: null,
-      failedReplication: null,
-      sendQueue: [this._dumpAll(args.filter)]
-    }
-
-    this._checkSendUpdate(peer)
-    return null
-  }
-
-  rpc_connect (args) {
-    let port = args.peer
-    if (this._peers[port]) {
-      throw new Error('Already peered')
-    }
-
-    if (args.filter && args.isClockSink) {
-      throw new Error('A partial replica cannot be a clock source')
-    }
-
-    if (this._basePeer) {
-      throw "don't know how to replicate from a cache"
-    }
-
-    let peer = this._peers[port] = {
-      cork: true, // don't send updates until they have acked the Hello
-      port: port,
-      isClockSource: !!args.isClockSource,
-      sending: false,
-      sendingFilter: null,
-      receivingFilter: null,
-      failedReplication: null,
-      sendQueue: [this._dumpAll(null)]
-    }
-
-    if (args.filter) {
-      this._basePeer = peer
-    }
-
-    return this._rpc.call(port, 'hello', {
-      isClockSource: !!args.isClockSink,
-      filter: args.filter
-    }).then(() => {
-      peer.cork = false
-      this._checkSendUpdate(peer)
-      return null
-    }, e => {
-      if (this._basePeer === peer) {
-        this._basePeer = null
-      }
-      if (this._peers[port] === peer) {
-        delete this._peers[port]
-      }
-      throw e
-    })
-  }
-
-  _keyMatchesFilter (key, filter) {
-    return !filter || filter.points.indexOf(key) >= 0 || filter.prefixes.some(prefix => key.startsWith(prefix))
-  }
-
-  _dumpAll (filter) {
-    let data = []
-    let clocks = []
-    for (let key of this._data.keys()) {
-      if (!this._keyMatchesFilter(key, filter)) {
-        continue
-      }
-      for (let value of this._data.get(key)) {
-        data.push({ key: key, value: value })
-      }
-    }
-    for (let sys in this._clocks) {
-      clocks.push({ system: sys, epoch: this._clocks[sys] })
-    }
-    return {
-      base: filter ? { system: this.id, epoch: this._epoch } : null,
-      filterChanges: filter ? {
-        addPoints: filter.points,
-        addPrefixes: filter.prefixes
-      } : null,
-      data: data,
-      clock_updates: clocks
+  epochSoon () {
+    if (!this._epochTimer) {
+      this._epochTimer = setTimeout(() => {
+        this._epochTimer = 0
+        this.newEpoch()
+      }, 500)
     }
   }
 
-  _checkSendUpdate (peer) {
-    if (peer.cork || peer.sending || !peer.sendQueue.length) return
-    let updates = peer.sendQueue
-
-    peer.sending = true
-    peer.sendQueue = []
-
-    this._rpc.call(peer.port, 'update', {
-      updates
-    }).then(() => {
-      peer.sending = false
-      this._checkSendUpdate(peer)
-    })
+  rpc_replicate_down (args) {
+    this._upQueue.push(args.msg)
+    this.epochSoon()
   }
 
-  rpc_update (args) {
-    let peer = this._peers[args.FROM]
-    for (let epoch of args.updates) {
-      epoch.peer = peer
-      this._nominate(epoch)
-    }
-    return null // just queueing
-  }
-
-  rpc_get (args) {
-    if (this._basePeer && !this._keyMatchesFilter(args.key, this._basePeer.receivingFilter)) {
-      throw "don't know how to get from a cache"
-    }
-
-    return Array.from(this._data.get(args.key) || new Set())
-  }
-
-  rpc_callback (args) {
-    if (args.path.length > 0) {
-      return this._rpc.call(args.path[0], 'callback', {
-        epoch: args.epoch, into_epoch: args.into_epoch, into: args.into,
-        path: args.path.slice(1)
-      })
-    } else {
-      if (!this._callbacksReceived[args.into] ||
-        args.epoch >= this._callbacksReceived[args.into].epoch) {
-        this._callbacksReceived[args.into] = args
-      }
-      return null
-    }
-  }
-
-  rpc_clocks (args) {
-    let out = {}
-    for (let sys in this._clocks) {
-      if (!out[sys]) out[sys] = {}
-      out[sys].i_have = this._clocks[sys]
-    }
-    for (let sys in this._callbacksReceived) {
-      if (!out[sys]) out[sys] = {}
-      out[sys].they_have = this._callbacksReceived[sys].epoch
-      out[sys].they_have_in = this._callbacksReceived[sys].into_epoch
-    }
-    return out
+  rpc_replicate_up (args) {
+    this._downQueue.push(args.msg)
+    this.epochSoon()
   }
 
   rpc_put (args) {
-    let data = []
-    args.data.forEach(item => {
-      data.push({ key: String(item.key), value: String(item.value) })
+    let resolver
+    let promise = new Promise((resolve, reject) => resolver = resolve)
+    this._injectQueue.push({
+      data: args.data,
+      callback: () => {
+        resolver({ epoch: this._epoch })
+      }
     })
-    return this._nominate({ type: 'put', data }) // here we do want to wait, RYW
+    this.epochSoon()
+    return promise
+  }
+
+  rpc_get (args) {
+    let val = this._myIndices.get(args.key)
+    if (val !== undefined) {
+      return { value: val }
+    }
+
+    val = this._binding.calculateIndex(this, args.key)
+    if (val !== undefined) {
+      return { value: val }
+    }
+
+    // let reqm = this._binding.calculateRequirements(this, args.key)
+    throw new Error('asdf')
+    // return this._rpc.call(this._upId, 'subscribe')
+  }
+
+  rpc_subscribe (args) {
+    throw new Error('asdf')
   }
 }
 
