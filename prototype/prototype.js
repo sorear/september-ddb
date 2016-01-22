@@ -64,16 +64,43 @@ class RPC {
   }
 }
 
+class DMap extends Map {
+  constructor (deffn) {
+    super()
+    this._default = deffn
+  }
+
+  open (key) {
+    if (this.has(key)) {
+      return this.get(key)
+    }
+    let nval = (this._default)()
+    this.set(key, nval)
+    return nval
+  }
+
+  fetch (key) {
+    return this.has(key) ? this.get(key) : (this._default)()
+  }
+}
+
 // for the purpose of this example, our payload is a set of strings keyed by a string
 // we track our present state, clocks?, peerings?
 class State {
   constructor (rpc) {
-    this._rpc = rpc
+    // relevant to the cut
     this._id = rpc.id
-    this._data = new Map()
     this._epoch = 0 // epoch 0 is ALWAYS empty
-    this._clocks = {} // Not part of the cut, advisory only
+    this._version = 0
+    this._clocks = {}
+    // modifying _clocks changes _epoch but not _version
 
+    this._urdata = new DMap(() => new Map())
+    this._baseIndices = new Map()
+    this._ourIndices = new Map()
+
+    // not relevant to the cut
+    this._rpc = rpc
     this._pending = []
     this._commitTimer = 0
 
@@ -94,7 +121,9 @@ class State {
     let clock_updates = []
     let data_updates = []
     let fire_callback = {}
-    let base_changed = false
+    let new_version = false
+
+    this._epoch++
 
     for (let update of pending) {
       let peer = update.peer // may be null for non-update events
@@ -107,9 +136,10 @@ class State {
         if (update.base.system === this.id) {
           // someone updating based on us.  OK
         } else if (update.base.system === peer.port && peer === this._basePeer) {
+          // someone thinks we're their downstream
           if (update.base.epoch > peer.baseEpoch) {
             peer.baseEpoch = update.base.epoch
-            base_changed = true
+            new_version = true
           }
 
           if (update.filterChanges) {
@@ -149,21 +179,32 @@ class State {
         fire_callback[callback.target] = callback
       }
 
-      for (let item of update.data || []) {
-        if (!this._data.get(item.key)) this._data.set(item.key, new Set())
-        if (this._data.get(item.key).has(item.value)) continue
-        data_updates.push(item)
-        this._data.get(item.key).add(item.value)
+      // only for not-the-base
+      for (let item of update.urdata || []) {
+        let schema_bucket = this._urdata.open(item.schema)
+        let key_bucket = schema_bucket.open(item.key)
+        if (TypedData.updateUr(key_bucket, item.delta)) {
+          key_bucket.stamp = this._epoch + 1
+          data_updates.push(item)
+          new_version = true
+        }
       }
 
-      update.resolve(null) // can't actually fire until after the epoch bump below ...
+      // only for the base
+      for (let item of update.cachedata || []) {
+        let index_bucket = this._cachedata.open(item.index)
+        let key_bucket = index_bucket.open(item.key)
+
+      }
+
+      update.resolve(null) // can't actually fire until the dust is settled
     }
 
     let forward_callbacks = []
 
-    if (base_changed || data_updates.length) {
-      // merely learning new clock values does not create a new epoch, although it is replicated
-      this._epoch++
+    if (new_version) {
+      // merely learning new clock values does not create a new version, although it is replicated
+      this._version = this._epoch
       this._clocks[this.id] = this._epoch
       clock_updates.push({ system: this.id, epoch: this._epoch })
       forward_callbacks.push({ target: this.id, path: [], epoch: this._epoch })
@@ -173,28 +214,30 @@ class State {
       let pending_callback = fire_callback[sys]
       this._callbacksSent[pending_callback.target] = pending_callback.epoch
       this._rpc.call(pending_callback.path[0], 'callback', {
-        epoch: pending_callback.epoch, into: this.id, into_epoch: this._epoch,
+        epoch: pending_callback.epoch, into: this.id, into_epoch: this._version,
         path: pending_callback.path.slice(1)
       })
       forward_callbacks.push(pending_callback)
     }
 
-    if (base_changed || forward_callbacks.length || data_updates.length || clock_updates.length) {
-      for (let port in this._peers) {
-        let peer = this._peers[port]
-        if (this._basePeer && peer !== this._basePeer) {
-          throw "don't know how to replicate down from a cache"
-        }
+    for (let port in this._peers) {
+      let peer = this._peers[port]
+      if (this._basePeer && peer !== this._basePeer) {
+        throw "don't know how to replicate down from a cache"
+      }
 
-        peer.sendQueue.push({
-          base: peer.sendingFilter ? { system: this.id, epoch: this._epoch } : null,
-          data: data_updates.filter(upd => this._keyMatchesFilter(upd.key, peer.sendingFilter)),
-          clocks_included: peer.isClockSource ? [] : clock_updates,
-          // the callbacks should retrace the replication path
-          callbacks: peer.isClockSource ? forward_callbacks.map(qe => {
-            return { target: qe.target, path: [this.id].concat(qe.path), epoch: qe.epoch }
-          }) : []
-        })
+      let message = {
+        base: peer.sendingFilter ? { system: this.id, epoch: this._epoch } : null,
+        data: data_updates.filter(upd => this._keyMatchesFilter(upd.key, peer.sendingFilter)),
+        clocks_included: peer.isClockSource ? [] : clock_updates,
+        // the callbacks should retrace the replication path
+        callbacks: peer.isClockSource ? forward_callbacks.map(qe => {
+          return { target: qe.target, path: [this.id].concat(qe.path), epoch: qe.epoch }
+        }) : []
+      }
+
+      if (message.base || message.data.length || message.clocks_included.length || message.callbacks.length) {
+        peer.sendQueue.push(message)
         this._checkSendUpdate(peer)
       }
     }

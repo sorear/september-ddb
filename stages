@@ -8,8 +8,11 @@
     A. Generating partial updates
     B. Accepting partial updates
     C. Request-initiated fetching
-    D. Writeback
-    E. Rolling leases
+    D. Clearly distinguish between urdata (propagates up/sideways) and indices (propagates down)
+    E. Cache chaining
+    F. Writeback
+    G. Rolling leases
+3. Implement "enough" of the schema system
 3. Design and implement sharding/replication for large subsystems.
 4. Reimplement in Rust
 4. Non-critical optimizations
