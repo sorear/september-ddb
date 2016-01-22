@@ -125,11 +125,13 @@ class State {
     this._dataEpoch = new Map()
 
     // Incoming updates from upstream
-    // { containsTo: 5, index: [{"key": 5}, {"key": 6, "value": 2}] }
+    // { containsTo: 5, epoch: 12, index: [{"key": 5}, {"key": 6, "value": 2}] }
     this._upQueue = []
     // Incoming updates from downstream
     // { id: 1, epoch: 17, data: [{"key": "A", "value": 1}] }
     this._downQueue = []
+    // { upId: 5, upEpoch: 99, data: [...] }
+    this._sibQueue = []
     this._injectQueue = []
 
     // Map of index keys to opaque values
@@ -137,6 +139,7 @@ class State {
 
     // map of IDs to { id: 15, want: Set(...) }
     this._downstreams = new Map()
+    this._siblings = new Map()
     this._nextSubId = 1
     this._subCallbacks = new Map()
   }
@@ -155,7 +158,6 @@ class State {
         if (ent[1] <= upo.containsTo) {
           this._dataEpoch.delete(ent[0])
           this._data.delete(ent[0])
-          datas_changed.add(ent[0])
         }
       }
 
@@ -166,6 +168,8 @@ class State {
           mapSet(this._upIndices, ixent.key, ixent.value)
         }
       }
+
+      this._upEpoch = upo.epoch
     }
 
     // incorporate data changes from below
@@ -205,7 +209,28 @@ class State {
       }
     }
 
-    // HERE sibling messages
+    for (let sno of this._sibQueue.splice()) {
+      if (sno.upId !== this._upId) {
+        continue
+      }
+
+      if (sno.upEpoch > this._upEpoch) {
+        // can't process this *yet* (all future from the same sibling will be similarly held up)
+        this._sibQueue.push(sno)
+        continue
+      }
+
+      for (let daent of sno.data) {
+        let prev = this._data.get(daent.key)
+        let next = this._binding.lubData(prev, daent.value)
+
+        if (!deepEqual(prev, next)) {
+          this._data.set(daent.key, next)
+          this._dataEpoch.set(daent.key, new_epoch)
+          datas_changed.add(daent.key)
+        }
+      }
+    }
 
     // calculate changes to our index values
     for (let ixkey of this._myIndices.keys()) {
@@ -219,6 +244,7 @@ class State {
     // pass index changes down
     for (let ds of this._downstreams.values()) {
       let msg = {
+        epoch: new_epoch,
         containsTo: down_maxindex.get(ds.id) || 0,
         index: []
       }
@@ -250,6 +276,23 @@ class State {
       this._rpc.qcall(this._upId, 'replicate_up', { msg })
     }
 
+    for (let sib of this._siblings.values()) {
+      let msg = {
+        upId: this._upId,
+        upEpoch: this._upEpoch,
+        data: []
+      }
+
+      for (let dkey of datas_changed) {
+        let dval = this._data.get(dkey)
+        if (dval !== undefined) {
+          msg.data.push({ key: dkey, value: dval })
+        }
+      }
+
+      this._rpc.qcall(sib.id, 'replicate_sibling', { msg })
+    }
+
     // pass to callbacks
     for (let cb of injected_callbacks) {
       cb()
@@ -272,6 +315,11 @@ class State {
 
   rpc_replicate_up (args) {
     this._downQueue.push(args.msg)
+    this.epochSoon()
+  }
+
+  rpc_replicate_sibling (args) {
+    this._sibQueue.push(args.msg)
     this.epochSoon()
   }
 
