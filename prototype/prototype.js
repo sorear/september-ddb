@@ -367,8 +367,39 @@ class State {
     let id = this._nextSubId++
     let subscribed = new Promise((resolve, reject) => this._subCallbacks.set(id, resolve))
 
-    this._rpc.call(this._upId, 'subscribe', { id, keys: Array.from(request) })
+    this._rpc.qcall(this._upId, 'subscribe', { id, keys: Array.from(request) }) // does not need to be anchored to epoch
     return subscribed.then(() => this.waitForIndices(keys))
+  }
+
+  rpc_connect_sibling (args) {
+    this._siblings.set(args.id, { id: args.id })
+
+    let msg = {
+      upId: this._upId,
+      upEpoch: this._upEpoch,
+      data: []
+    }
+
+    for (let entry of this._data) {
+      msg.data.push({ key: entry[0], value: entry[1] })
+    }
+
+    this._rpc.qcall(args.id, 'replicate_sibling', { msg })
+  }
+
+  rpc_connect_up (args) {
+    if (this._upId || this._downstreams.size > 0 || this._data.size > 0) {
+      throw new Error('too late to become a cache')
+    }
+
+    this._upId = args.id
+    this._upEpoch = 0
+    this._rpc.qcall(args.id, 'connect_down', {})
+  }
+
+  rpc_connect_down (args) {
+    this._downstreams.set(args.FROM, { id: args.FROM, want: new Set() })
+    this._rpc.qcall(args.FROM, 'replicate_down', { epoch: this._epoch, containsTo: 0, index: [] })
   }
 
   rpc_subscribe_down (args) {
