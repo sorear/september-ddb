@@ -137,6 +137,8 @@ class State {
 
     // map of IDs to { id: 15, want: Set(...) }
     this._downstreams = new Map()
+    this._nextSubId = 1
+    this._subCallbacks = new Map()
   }
 
   newEpoch () {
@@ -286,24 +288,77 @@ class State {
     return promise
   }
 
+  waitForIndices (keys) {
+    let request = new Set()
+    let ready = true
+    for (let key of keys) {
+      if (this._myIndices.get(key) !== undefined) {
+        continue
+      }
+
+      let val = this._binding.calculateIndex(this, key)
+      if (val !== undefined) {
+        this._myIndices.set(key, val)
+        continue
+      }
+
+      for (let req of this._binding.calculateRequirements(this, key)) {
+        request.add(req)
+      }
+      ready = false
+      if (request.size === 0 || !this._upId) {
+        throw new Error('calculateRequirements invalidly returned empty')
+      }
+    }
+
+    if (ready) {
+      return Promise.resolve(null)
+    }
+
+    // otherwise we should subscribe for *request* from our upstream and continue
+    let id = this._nextSubId++
+    let subscribed = new Promise((resolve, reject) => this._subCallbacks.set(id, resolve))
+
+    this._rpc.call(this._upId, 'subscribe', { id, keys: Array.from(request) })
+    return subscribed.then(() => this.waitForIndices(keys))
+  }
+
+  rpc_subscribe_down (args) {
+    if (this._upQueue.length > 0) {
+      this.newEpoch() // may require fiddling for distrib
+    }
+
+    for (let ixent of args.index) {
+      let prev = this._upIndices.get(ixent.key)
+      if (!deepEqual(prev, ixent.value)) {
+        mapSet(this._upIndices, ixent.key, ixent.value)
+      }
+    }
+
+    let cb = this._subCallbacks.get(args.id)
+    this._subCallbacks.delete(args.id)
+    cb()
+    return null
+  }
+
   rpc_get (args) {
-    let val = this._myIndices.get(args.key)
-    if (val !== undefined) {
-      return { value: val }
-    }
-
-    val = this._binding.calculateIndex(this, args.key)
-    if (val !== undefined) {
-      return { value: val }
-    }
-
-    // let reqm = this._binding.calculateRequirements(this, args.key)
-    throw new Error('asdf')
-    // return this._rpc.call(this._upId, 'subscribe')
+    this.waitForIndices([args.key]).then(() => {
+      return { value: this._myIndices.get(args.key) }
+    })
   }
 
   rpc_subscribe (args) {
-    throw new Error('asdf')
+    this.waitForIndices(args.keys).then(() => {
+      let ds = this._downstreams.get(args.FROM)
+      let index = []
+      for (let key of args.keys) {
+        if (ds.want.has(key)) continue
+        ds.want.add(key)
+        index.push({ key, value: this._myIndices.get(key) })
+      }
+      this._rpc.qcall(args.FROM, 'subscribe_down', { index, id: args.id })
+    })
+    return null
   }
 }
 
