@@ -96,6 +96,68 @@ function deepEqual (a, b) {
 }
 
 class Binding {
+  // our data for this demo is the simplest possible LWW key-value store
+  lubData (dkey, value1, value2) {
+    if (value1 === undefined) return value2
+    if (value2 === undefined) return value1
+    return value1.v > value2.v ? value1 : value2
+  }
+
+  // index kfoo => data for key foo
+  // index dbar => all data with value=bar
+  // index a => EVERYTHING
+  calculateIndex (state, ikey) {
+    let superval = state._upIndices.get(ikey)
+    let need = new Set()
+    let value = null
+
+    if (superval === undefined) {
+      // currently used in all branches.  not fundamental
+      need.add(ikey)
+    }
+
+    if (ikey[0] === 'k') {
+      let dkey = ikey.substring(1)
+      value = this.lubData(dkey, state._data.get(dkey), superval) || { d: null, v: 0 }
+    } else if (ikey[0] === 'd' || ikey === 'a') {
+      let match = ikey === 'a' ? null : ikey.substring(1)
+      superval = new Map(superval || [])
+      // a change in the current _data could
+      // * add to the mapping
+      for (let ent of state._data) {
+        if (superval.has(ent[0])) {
+          // a matching key could delete from the index.
+          // since it's in the index, we know this is the most recent upstream version.
+          let upd = this.lubData(ent[0], ent[1], superval.get(ent[0]))
+          // upd is now the true up to date value; drop if it's no longer a match, or update
+          mapSet(superval, ent[0], (match === null || upd.d === match) ? upd : undefined)
+        } else {
+          // a change to something not in the map could require adding it.
+          // only germane if the value matches.
+          if (match === null || ent[1].d === match) {
+            // might still be stale
+            let updata = state._upIndices.get(ent[0])
+            if (state._upId && !updata) {
+              // we don't know if this is stale
+              need.add(ent[0])
+            }
+
+            let upd = this.lubData(ent[0], ent[1], updata)
+            if (match === null || upd.d === match) {
+              // genuine insert
+              superval.set(ent[0], upd)
+            }
+          }
+        }
+      }
+      value = Array.from(superval)
+    }
+
+    if (need.size > 0) {
+      value = undefined
+    }
+    return { need, value }
+  }
 }
 
 class State {
@@ -182,7 +244,7 @@ class State {
 
       for (let daent of dno.data) {
         let prev = this._data.get(daent.key)
-        let next = this._binding.lubData(prev, daent.value)
+        let next = this._binding.lubData(daent.key, prev, daent.value)
 
         if (!deepEqual(prev, next)) {
           this._data.set(daent.key, next)
@@ -199,7 +261,7 @@ class State {
 
       for (let daent of dno.data) {
         let prev = this._data.get(daent.key)
-        let next = this._binding.lubData(prev, daent.value)
+        let next = this._binding.lubData(daent.key, prev, daent.value)
 
         if (!deepEqual(prev, next)) {
           this._data.set(daent.key, next)
@@ -222,7 +284,7 @@ class State {
 
       for (let daent of sno.data) {
         let prev = this._data.get(daent.key)
-        let next = this._binding.lubData(prev, daent.value)
+        let next = this._binding.lubData(daent.key, prev, daent.value)
 
         if (!deepEqual(prev, next)) {
           this._data.set(daent.key, next)
@@ -234,9 +296,9 @@ class State {
 
     // calculate changes to our index values
     for (let ixkey of this._myIndices.keys()) {
-      let recalc = this._binding.calculateIndex(this, ixkey)
-      if (JSON.stringify(recalc) !== JSON.stringify(this._myIndices.get(ixkey))) {
-        mapSet(this._myIndices, ixkey, recalc)
+      let { value } = this._binding.calculateIndex(this, ixkey)
+      if (!deepEqual(value, this._myIndices.get(ixkey))) {
+        mapSet(this._myIndices, ixkey, value)
         myindex_changed.add(ixkey)
       }
     }
@@ -344,13 +406,13 @@ class State {
         continue
       }
 
-      let val = this._binding.calculateIndex(this, key)
-      if (val !== undefined) {
-        this._myIndices.set(key, val)
+      let { value, need } = this._binding.calculateIndex(this, key)
+      if (value !== undefined) {
+        this._myIndices.set(key, value)
         continue
       }
 
-      for (let req of this._binding.calculateRequirements(this, key)) {
+      for (let req of need) {
         request.add(req)
       }
       ready = false
