@@ -479,7 +479,12 @@ class State {
       msg.data.push({ key: entry[0], value: entry[1] })
     }
 
+    this._rpc.qcall(args.id, 'connect_rsibling', {})
     this._rpc.qcall(args.id, 'replicate_sibling', { msg })
+  }
+
+  rpc_connect_rsibling (args) {
+    this._rsiblings.set(args.FROM, { id: args.FROM })
   }
 
   rpc_connect_up (args) {
