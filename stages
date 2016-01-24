@@ -12,11 +12,15 @@
     E. Cache chaining
     F. Writeback
     G. Rolling leases
+    H. Handoff (Optional; successor nodes work nearly as well)
 3. Implement "enough" of the schema system
-3. Design and implement sharding/replication for large subsystems.
-4. Reimplement in Rust
-4. Non-critical optimizations
-    A. Replicate data once over any given link
-    B. Pipelineable slow indices
-4. User-RPCs; may require control plane work, but after that it's just barriers
-5. Views: acts like an RPC, but handles by the nearest subsystem with all the data
+4. Advanced topics
+    A. Barriers
+    B. Initial user-RPC
+    C. Suppress data changes when not useful
+    D. Replicate data once over any given link
+    E. Pipelineable slow indices
+    F. Views: acts like an RPC, but handles by the nearest subsystem with all the data
+5. Design next protocol
+6. Design and implement sharding/replication for large subsystems.
+7. Reimplement in Rust

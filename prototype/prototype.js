@@ -204,6 +204,9 @@ class State {
     this._siblings = new Map()
     this._nextSubId = 1
     this._subCallbacks = new Map()
+
+    // clocks of ancestor and sibling systems which are included in our cut
+    this._ancestorClocks = new Map()
   }
 
   newEpoch () {
@@ -211,11 +214,24 @@ class State {
     let upindex_changed = new Set()
     let myindex_changed = new Set()
     let down_maxindex = new Map()
+    let clocks_changed = []
 
     let new_epoch = ++this._epoch
 
+    function copyClocks (list) {
+      for (let entry of list) {
+        if (entry.clock > (this._ancestorClocks.get(entry.system) || 0)) {
+          this._ancestorClocks.set(entry.system, entry.clock)
+          clocks_changed.push(entry)
+        }
+      }
+    }
+
+    copyClocks([ { system: this._rpc.id, clock: new_epoch } ])
+
     // incorporate index changes from above
     for (let upo of this._upQueue.splice()) {
+      copyClocks(upo.clocks)
       for (let ent of this._dataEpoch) {
         if (ent[1] <= upo.containsTo) {
           this._dataEpoch.delete(ent[0])
@@ -234,15 +250,8 @@ class State {
       this._upEpoch = upo.epoch
     }
 
-    // incorporate data changes from below
-    for (let dno of this._downQueue.splice()) {
-      if (!down_maxindex.has(dno.id)) {
-        down_maxindex.set(dno.id, 0)
-      }
-
-      down_maxindex.set(dno.id, Math.max(down_maxindex.get(dno.id), dno.epoch))
-
-      for (let daent of dno.data) {
+    function copyData (data) {
+      for (let daent of data) {
         let prev = this._data.get(daent.key)
         let next = this._binding.lubData(daent.key, prev, daent.value)
 
@@ -254,21 +263,22 @@ class State {
       }
     }
 
+    // incorporate data changes from below
+    for (let dno of this._downQueue.splice()) {
+      if (!down_maxindex.has(dno.id)) {
+        down_maxindex.set(dno.id, 0)
+      }
+
+      down_maxindex.set(dno.id, Math.max(down_maxindex.get(dno.id), dno.epoch))
+      copyData(dno.data)
+    }
+
     // incorporate injected changes
     let injected_callbacks = []
     for (let dno of this._injectQueue.splice()) {
       injected_callbacks.push(dno.callback)
 
-      for (let daent of dno.data) {
-        let prev = this._data.get(daent.key)
-        let next = this._binding.lubData(daent.key, prev, daent.value)
-
-        if (!deepEqual(prev, next)) {
-          this._data.set(daent.key, next)
-          this._dataEpoch.set(daent.key, new_epoch)
-          datas_changed.add(daent.key)
-        }
-      }
+      copyData(dno.data)
     }
 
     for (let sno of this._sibQueue.splice()) {
@@ -282,16 +292,8 @@ class State {
         continue
       }
 
-      for (let daent of sno.data) {
-        let prev = this._data.get(daent.key)
-        let next = this._binding.lubData(daent.key, prev, daent.value)
-
-        if (!deepEqual(prev, next)) {
-          this._data.set(daent.key, next)
-          this._dataEpoch.set(daent.key, new_epoch)
-          datas_changed.add(daent.key)
-        }
-      }
+      copyClocks(sno.clocks)
+      copyData(sno.data)
     }
 
     // calculate changes to our index values
@@ -307,6 +309,7 @@ class State {
     for (let ds of this._downstreams.values()) {
       let msg = {
         epoch: new_epoch,
+        clocks: clocks_changed,
         containsTo: down_maxindex.get(ds.id) || 0,
         index: []
       }
@@ -342,6 +345,7 @@ class State {
       let msg = {
         upId: this._upId,
         upEpoch: this._upEpoch,
+        clocks: clocks_changed,
         data: []
       }
 
