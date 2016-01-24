@@ -461,12 +461,17 @@ class State {
     return subscribed.then(() => this.waitForIndices(keys))
   }
 
+  dumpClocks () {
+    return Array.from(this._ancestorClocks).map(ent => ({ system: ent[0], clock: ent[1] }))
+  }
+
   rpc_connect_sibling (args) {
     this._siblings.set(args.id, { id: args.id })
 
     let msg = {
       upId: this._upId,
       upEpoch: this._upEpoch,
+      clocks: this.dumpClocks(),
       data: []
     }
 
@@ -489,7 +494,7 @@ class State {
 
   rpc_connect_down (args) {
     this._downstreams.set(args.FROM, { id: args.FROM, want: new Set() })
-    this._rpc.qcall(args.FROM, 'replicate_down', { epoch: this._epoch, containsTo: 0, index: [] })
+    this._rpc.qcall(args.FROM, 'replicate_down', { epoch: this._epoch, clocks: this.dumpClocks(), containsTo: 0, index: [] })
   }
 
   rpc_subscribe_down (args) {
