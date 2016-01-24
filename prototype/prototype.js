@@ -66,8 +66,7 @@ class RPC {
 
   qcall (dest, name, args) {
     let ready = this._readyp.get(dest) || Promise.resolve(null)
-    let clearNext
-    let newReady = new Promise((resolve, reject) => clearNext = resolve)
+    let { resolver: clearNext, promise: newReady } = promiseAndResolver()
     this._readyp.set(dest, newReady)
 
     return ready.then(() => {
@@ -93,6 +92,12 @@ function mapSet (map, key, val) {
 
 function deepEqual (a, b) {
   return JSON.stringify(a) === JSON.stringify(b)
+}
+
+function promiseAndResolver () {
+  let resolver
+  let promise = new Promise((resolve, reject) => resolver = resolve)
+  return { promise, resolver }
 }
 
 class Binding {
@@ -207,6 +212,8 @@ class State {
 
     // clocks of ancestor and sibling systems which are included in our cut
     this._ancestorClocks = new Map()
+    // [{ system, clock, target }]
+    this._ancestorTriggers = []
   }
 
   newEpoch () {
@@ -363,6 +370,14 @@ class State {
     for (let cb of injected_callbacks) {
       cb()
     }
+
+    this._ancestorTriggers = this._ancestorTriggers.filter(({ system, clock, cb }) => {
+      if (this._ancestorClocks.get(system) >= clock) {
+        cb()
+      } else {
+        return true
+      }
+    })
   }
 
   epochSoon () {
@@ -390,8 +405,7 @@ class State {
   }
 
   rpc_put (args) {
-    let resolver
-    let promise = new Promise((resolve, reject) => resolver = resolve)
+    let { promise, resolver } = promiseAndResolver()
     this._injectQueue.push({
       data: args.data,
       callback: () => {
@@ -399,6 +413,16 @@ class State {
       }
     })
     this.epochSoon()
+    return promise
+  }
+
+  rpc_acquire (args) {
+    let { promise, resolver } = promiseAndResolver()
+    this._ancestorTriggers.push({
+      system: args.system,
+      clock: args.clock,
+      cb: resolver
+    })
     return promise
   }
 
