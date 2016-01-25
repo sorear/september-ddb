@@ -349,17 +349,17 @@ class State {
 
     // pass data changes up
     if (this._upId && data_vec.length > 0) {
-      this._rpc.qcall(this._upId, 'replicate_up', { msg: { epoch: new_epoch, data: data_vec } })
+      this._rpc.qcall(this._upId, 'replicate_up', { epoch: new_epoch, data: data_vec })
     }
 
     for (let sib of this._siblings.values()) {
       if (data_vec.length > 0 || this.checkClockTriggers(sib)) {
-        this._rpc.qcall(sib.id, 'replicate_sibling', { msg: {
+        this._rpc.qcall(sib.id, 'replicate_sibling', {
           upId: this._upId,
           upEpoch: this._upEpoch,
           clocks: clocks_changed,
           data: data_vec
-        }})
+        })
 
         this.updatePartnerClocks(sib)
       }
@@ -395,18 +395,18 @@ class State {
   }
 
   rpc_replicate_down (args) {
-    this._upQueue.push(args.msg)
+    this._upQueue.push(args)
     this.epochSoon()
   }
 
   rpc_replicate_up (args) {
-    args.msg.id = args.FROM
-    this._downQueue.push(args.msg)
+    args.id = args.FROM
+    this._downQueue.push(args)
     this.epochSoon()
   }
 
   rpc_replicate_sibling (args) {
-    this._sibQueue.push(args.msg)
+    this._sibQueue.push(args)
     this.epochSoon()
   }
 
@@ -547,7 +547,7 @@ class State {
     }
 
     this._rpc.qcall(args.id, 'connect_rsibling', {})
-    this._rpc.qcall(args.id, 'replicate_sibling', { msg })
+    this._rpc.qcall(args.id, 'replicate_sibling', msg)
   }
 
   rpc_connect_rsibling (args) {
