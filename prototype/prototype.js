@@ -214,6 +214,7 @@ class State {
     this._ancestorClocks = new Map()
     // [{ system, clock, target }]
     this._ancestorTriggers = []
+    this._rsiblings = new Map()
   }
 
   newEpoch () {
@@ -296,6 +297,7 @@ class State {
       if (sno.upEpoch > this._upEpoch) {
         // can't process this *yet* (all future from the same sibling will be similarly held up)
         this._sibQueue.push(sno)
+        this.addTrigger(sno.upId, sno.upEpoch)
         continue
       }
 
@@ -314,56 +316,47 @@ class State {
 
     // pass index changes down
     for (let ds of this._downstreams.values()) {
-      let msg = {
-        epoch: new_epoch,
-        clocks: clocks_changed,
-        containsTo: down_maxindex.get(ds.id) || 0,
-        index: []
-      }
+      let containsTo = down_maxindex.get(ds.id) || 0
+      let index = []
 
       for (let ixkey of myindex_changed) {
         if (ds.want.has(ixkey)) {
-          msg.index.push({ key: ixkey, value: this._myIndices.get(ixkey) })
+          index.push({ key: ixkey, value: this._myIndices.get(ixkey) })
         }
       }
 
-      this._rpc.qcall(ds.id, 'replicate_down', { msg })
+      if (containsTo > 0 || index.length > 0 || this.checkClockTriggers(ds)) {
+        this._rpc.qcall(ds.id, 'replicate_down', {
+          epoch: new_epoch, clocks: this.diffClocks(ds.sentClocks), containsTo, index
+        })
+        this.updatePartnerClocks(ds)
+      }
+    }
+
+    let data_vec = []
+    for (let dkey of datas_changed) {
+      let dval = this._data.get(dkey)
+      if (dval !== undefined) {
+        data_vec.push({ key: dkey, value: dval })
+      }
     }
 
     // pass data changes up
-    if (this._upId) {
-      let msg = {
-        id: this._rpc.id,
-        epoch: new_epoch,
-        data: []
-      }
-
-      for (let dkey of datas_changed) {
-        let dval = this._data.get(dkey)
-        if (dval !== undefined) {
-          msg.data.push({ key: dkey, value: dval })
-        }
-      }
-
-      this._rpc.qcall(this._upId, 'replicate_up', { msg })
+    if (this._upId && data_vec.length > 0) {
+      this._rpc.qcall(this._upId, 'replicate_up', { msg: { epoch: new_epoch, data: data_vec } })
     }
 
     for (let sib of this._siblings.values()) {
-      let msg = {
-        upId: this._upId,
-        upEpoch: this._upEpoch,
-        clocks: clocks_changed,
-        data: []
-      }
+      if (data_vec.length > 0 || this.checkClockTriggers(sib)) {
+        this._rpc.qcall(sib.id, 'replicate_sibling', { msg: {
+          upId: this._upId,
+          upEpoch: this._upEpoch,
+          clocks: clocks_changed,
+          data: data_vec
+        }})
 
-      for (let dkey of datas_changed) {
-        let dval = this._data.get(dkey)
-        if (dval !== undefined) {
-          msg.data.push({ key: dkey, value: dval })
-        }
+        this.updatePartnerClocks(sib)
       }
-
-      this._rpc.qcall(sib.id, 'replicate_sibling', { msg })
     }
 
     // pass to callbacks
@@ -373,7 +366,7 @@ class State {
 
     this._ancestorTriggers = this._ancestorTriggers.filter(({ system, clock, cb }) => {
       if (this._ancestorClocks.get(system) >= clock) {
-        cb()
+        if (cb) cb()
       } else {
         return true
       }
@@ -395,6 +388,7 @@ class State {
   }
 
   rpc_replicate_up (args) {
+    args.msg.id = args.FROM
     this._downQueue.push(args.msg)
     this.epochSoon()
   }
@@ -416,13 +410,69 @@ class State {
     return promise
   }
 
+  addTrigger (system, clock, cb) {
+    if (!this._ancestorTriggers.some(trig => trig.system === system && trig.clock === clock)) {
+      // this is a wholly new trigger!  notify our rsibs and ancestors that We Care about this and they should send it even if there's no salient data
+      if (this._upId) {
+        this._rpc.qcall(this._upId, 'notify_trigger', { system, clock })
+      }
+      for (let rs of this._rsiblings.values()) {
+        this._rpc.qcall(rs.id, 'notify_trigger', { system, clock })
+      }
+    }
+    this._ancestorTriggers.push({ system, clock, cb })
+  }
+
+  rpc_notify_trigger (args) {
+    // one of our downstreams and/or siblings is waiting patiently for version BLAH.
+
+    for (let partner of [this._downstreams, this._siblings].map(x => x.get(args.FROM)).filter(y => y)) {
+      // maybe our messages just crossed in the 'net.
+      if ((partner.sentClocks.get(args.system) || 0) >= args.clock) {
+        // they'll get it in due time.
+        continue
+      }
+
+      if ((this._ancestorClocks.get(args.system) || 0) >= args.clock) {
+        // we have it, but never sent it.  send it now.
+        // we know there are no data/index changes because those force a send.
+        // (as does containsTo)
+        if ('want' in partner) {
+          this._rpc.qcall(partner.id, 'replicate_down', {
+            epoch: this._epoch, clocks: this.diffClocks(partner.sentClocks), containsTo: 0, index: []
+          })
+          this.updatePartnerClocks(partner)
+        } else {
+          this._rpc.qcall(partner.id, 'replicate_sibling', {
+            upId: this._upId, upEpoch: this._upEpoch, clocks: this.diffClocks(partner.sentClocks), data: []
+          })
+          this.updatePartnerClocks(partner)
+        }
+        continue
+      }
+
+      // we don't have it.  remember they want it, and make sure *we* get it
+      partner.triggerClocks.push({ system: args.system, clock: args.clock })
+      this.addTrigger(args.system, args.clock)
+    }
+  }
+
+  updatePartnerClocks (partner) {
+    partner.sentClocks = new Map(this._ancestorClocks)
+    partner.triggerClocks = partner.triggerClocks.filter(({ system, clock }) => {
+      return (this._ancestorClocks.get(system) || 0) < clock
+    })
+  }
+
+  checkClockTriggers (partner) {
+    return partner.triggerClocks.some(({ system, clock }) => {
+      return (this._ancestorClocks.get(system) || 0) >= clock
+    })
+  }
+
   rpc_acquire (args) {
     let { promise, resolver } = promiseAndResolver()
-    this._ancestorTriggers.push({
-      system: args.system,
-      clock: args.clock,
-      cb: resolver
-    })
+    this.addTrigger(args.system, args.clock, resolver)
     return promise
   }
 
@@ -465,8 +515,12 @@ class State {
     return Array.from(this._ancestorClocks).map(ent => ({ system: ent[0], clock: ent[1] }))
   }
 
+  diffClocks (old) {
+    return this.dumpClocks().filter(({ system, clock }) => clock > (old.get(system) || 0))
+  }
+
   rpc_connect_sibling (args) {
-    this._siblings.set(args.id, { id: args.id })
+    this._siblings.set(args.id, { id: args.id, sentClocks: new Map(this._ancestorClocks), triggerClocks: [] })
 
     let msg = {
       upId: this._upId,
@@ -485,6 +539,10 @@ class State {
 
   rpc_connect_rsibling (args) {
     this._rsiblings.set(args.FROM, { id: args.FROM })
+    for (let trig of this._ancestorTriggers) {
+      // make sure it knows what we're waiting for
+      this._rpc.qcall(args.FROM, 'notify_trigger', { system: trig.system, clock: trig.clock })
+    }
   }
 
   rpc_connect_up (args) {
@@ -498,7 +556,7 @@ class State {
   }
 
   rpc_connect_down (args) {
-    this._downstreams.set(args.FROM, { id: args.FROM, want: new Set() })
+    this._downstreams.set(args.FROM, { id: args.FROM, want: new Set(), sentClocks: new Map(this._ancestorClocks), triggerClocks: [] })
     this._rpc.qcall(args.FROM, 'replicate_down', { epoch: this._epoch, clocks: this.dumpClocks(), containsTo: 0, index: [] })
   }
 
