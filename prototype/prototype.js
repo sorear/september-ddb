@@ -210,6 +210,10 @@ class State {
     this._nextSubId = 1
     this._subCallbacks = new Map()
 
+    this._barrierNextId = 1
+    this._barrierQueue = []
+    this._barrierCallbacks = new Map()
+
     // clocks of ancestor and sibling systems which are included in our cut
     this._ancestorClocks = new Map()
     // [{ system, clock, target }]
@@ -371,6 +375,12 @@ class State {
         return true
       }
     })
+
+    for (let barrier of this._barrierQueue.splice()) {
+      this.doBarrier(barrier.target).then(epoch => {
+        return this._rpc.qcall(barrier.from, 'barrier_down', { epoch, id: barrier.id })
+      })
+    }
   }
 
   epochSoon () {
@@ -576,6 +586,37 @@ class State {
     this._subCallbacks.delete(args.id)
     cb()
     return null
+  }
+
+  rpc_barrier_down (args) {
+    let cb = this._barrierCallbacks.get(args.id)
+    this._barrierCallbacks.delete(args.id)
+    cb(args.epoch)
+    return null
+  }
+
+  rpc_barrier_up (args) {
+    // we can short-circuit this in many cases
+    this._barrierQueue.push({ target: args.target, id: args.id, from: args.FROM })
+    this.epochSoon()
+  }
+
+  doBarrier (target) {
+    if (!this._upId) {
+      return Promise.resolve(0)
+    }
+    if (target === this._rpc.id) {
+      return Promise.resolve(this._epoch)
+    }
+    let id = this._barrierNextId++
+    let { promise, resolver } = promiseAndResolver()
+    this._barrierCallbacks.set(id, resolver)
+    this._rpc.qcall(this._upId, 'barrier_up', { target, id })
+    return promise
+  }
+
+  rpc_barrier (args) {
+    return this.doBarrier(args.target)
   }
 
   rpc_get (args) {
