@@ -1,6 +1,7 @@
 'use strict'
 const http = require('http')
 const got = require('got')
+const chalk = require('chalk')
 
 class RPC {
   constructor (id) {
@@ -18,6 +19,7 @@ class RPC {
   }
 
   server (handler) {
+    const color = ['red', 'yellow', 'green', 'cyan', 'blue', 'magenta'][this.id % 6]
     http.createServer((req, res) => {
       let parts = []
       let id = '#' + this._next_id++
@@ -29,14 +31,14 @@ class RPC {
           let text = Buffer.concat(parts).toString('utf8')
           json = JSON.parse(text)
           setTimeout(() => {
-            console.log('%d %d IN<- %s %s %s %s', Date.now(), this.id, json.FROM, id, name, JSON.stringify(json, null, 2))
+            console.log(chalk[color]('%d %d IN<- %s %s %s %s'), Date.now(), this.id, json && json.FROM, id, name, JSON.stringify(json, null, 2))
             resolve(json)
           }, this.netdelay())
         }).then(json => handler(name, json)).then(
           result => [200, new Buffer(JSON.stringify(outdata = result, null, 2) + '\n', 'utf8')],
           error => [500, new Buffer(JSON.stringify(outdata = (error instanceof Error ? error.toString() : error), null, 2) + '\n', 'utf8')]
         ).then(code_buf => {
-          console.log('%d %d IN-> %s %s %s', Date.now(), this.id, json.FROM, id, JSON.stringify(outdata, null, 2))
+          console.log(chalk[color]('%d %d IN-> %s %s %s'), Date.now(), this.id, json && json.FROM, id, JSON.stringify(outdata, null, 2))
           setTimeout(() => {
             res.writeHead(code_buf[0], {
               'Content-Length': code_buf[1].length,
@@ -52,13 +54,13 @@ class RPC {
   call (dest, name, args) {
     let id = '#' + this._next_id++
     args.FROM = this.id
-    console.log('%s %s OU-> %s %s %s %s', Date.now(), this.id, dest, id, name, JSON.stringify(args, null, 2))
+    console.log(chalk.black.bold('%s %s OU-> %s %s %s %s'), Date.now(), this.id, dest, id, name, JSON.stringify(args, null, 2))
     let prom = got.post(`http://localhost:${dest}/${name}`,
       { body: JSON.stringify(args, null, 2), json: true }).then(response => response.body, err => { throw err.response.body })
 
     prom.then(
-      result => console.log('%s %s OU<- %s %s %s', Date.now(), this.id, dest, id, JSON.stringify(result, null, 2)),
-      error => console.log('%s %s OU<- %s %s %s', Date.now(), this.id, dest, id, error.message)
+      result => console.log(chalk.black.bold('%s %s OU<- %s %s %s'), Date.now(), this.id, dest, id, JSON.stringify(result, null, 2)),
+      error => console.log(chalk.black.bold('%s %s OU<- %s %s %s'), Date.now(), this.id, dest, id, error.message)
     )
 
     return prom
@@ -116,7 +118,7 @@ class Binding {
     let need = new Set()
     let value = null
 
-    if (superval === undefined) {
+    if (superval === undefined && state._upId) {
       // currently used in all branches.  not fundamental
       need.add(ikey)
     }
@@ -230,7 +232,7 @@ class State {
 
     let new_epoch = ++this._epoch
 
-    function copyClocks (list) {
+    const copyClocks = (list) => {
       for (let entry of list) {
         if (entry.clock > (this._ancestorClocks.get(entry.system) || 0)) {
           this._ancestorClocks.set(entry.system, entry.clock)
@@ -242,7 +244,7 @@ class State {
     copyClocks([ { system: this._rpc.id, clock: new_epoch } ])
 
     // incorporate index changes from above
-    for (let upo of this._upQueue.splice()) {
+    for (let upo of this._upQueue.splice(0)) {
       copyClocks(upo.clocks)
       for (let ent of this._dataEpoch) {
         if (ent[1] <= upo.containsTo) {
@@ -262,7 +264,7 @@ class State {
       this._upEpoch = upo.epoch
     }
 
-    function copyData (data) {
+    const copyData = (data) => {
       for (let daent of data) {
         let prev = this._data.get(daent.key)
         let next = this._binding.lubData(daent.key, prev, daent.value)
@@ -276,7 +278,7 @@ class State {
     }
 
     // incorporate data changes from below
-    for (let dno of this._downQueue.splice()) {
+    for (let dno of this._downQueue.splice(0)) {
       if (!down_maxindex.has(dno.id)) {
         down_maxindex.set(dno.id, 0)
       }
@@ -287,13 +289,13 @@ class State {
 
     // incorporate injected changes
     let injected_callbacks = []
-    for (let dno of this._injectQueue.splice()) {
+    for (let dno of this._injectQueue.splice(0)) {
       injected_callbacks.push(dno.callback)
 
       copyData(dno.data)
     }
 
-    for (let sno of this._sibQueue.splice()) {
+    for (let sno of this._sibQueue.splice(0)) {
       if (sno.upId !== this._upId) {
         continue
       }
@@ -376,7 +378,7 @@ class State {
       }
     })
 
-    for (let barrier of this._barrierQueue.splice()) {
+    for (let barrier of this._barrierQueue.splice(0)) {
       this.doBarrier(barrier.target).then(epoch => {
         return this._rpc.qcall(barrier.from, 'barrier_down', { epoch, id: barrier.id })
       })
@@ -495,6 +497,7 @@ class State {
       }
 
       let { value, need } = this._binding.calculateIndex(this, key)
+      // console.log(key, value, need)
       if (value !== undefined) {
         this._myIndices.set(key, value)
         continue
@@ -620,7 +623,7 @@ class State {
   }
 
   rpc_get (args) {
-    this.waitForIndices([args.key]).then(() => {
+    return this.waitForIndices([args.key]).then(() => {
       return { value: this._myIndices.get(args.key) }
     })
   }
