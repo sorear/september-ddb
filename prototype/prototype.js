@@ -150,29 +150,28 @@ class Binding {
   // index dbar => all data with value=bar
   // index a => EVERYTHING
   calculateIndex (state, ikey) {
-    let superval
     let need = new Set()
     let value = null
 
-    if (state.upId === null) {
-      superval = []
-    } else if (state._upIndices.has(ikey)) {
-      superval = state._upIndices.get(ikey)
-    } else {
-      for (let fb of this.ikFallback(ikey)) {
-        if (state._upIndices.has(fb)) {
-          superval = state._upIndices.get(fb).filter(kv => this.ikMatches(ikey, kv[0], kv[1]))
-          break
+    const fetch_super = (iks) => {
+      if (state.upId === null) {
+        return []
+      } else if (state._upIndices.has(iks)) {
+        return state._upIndices.get(iks)
+      } else {
+        for (let fb of this.ikFallback(iks)) {
+          if (state._upIndices.has(fb)) {
+            return state._upIndices.get(fb).filter(kv => this.ikMatches(iks, kv[0], kv[1]))
+          }
         }
-      }
 
-      if (!superval) {
-        superval = []
         need.add(ikey)
+        return []
       }
     }
 
     // console.log(state.upId, state._upIndices, ikey, superval)
+    let superval = fetch_super(ikey)
     superval = new Map(superval)
     // a change in the current _data could
     // * add to the mapping
@@ -188,12 +187,7 @@ class Binding {
         // only germane if the value matches.
         if (this.ikMatches(ikey, ent[0], ent[1])) {
           // might still be stale
-          let updata = state._upIndices.get(ent[0])
-          if (state.upId && !updata) {
-            // we don't know if this is stale
-            need.add(ent[0])
-          }
-
+          let updata = fetch_super('k' + ent[0])
           let upd = this.lubData(ent[0], ent[1], updata[0])
           if (this.ikMatches(ikey, ent[0], upd)) {
             // genuine insert
