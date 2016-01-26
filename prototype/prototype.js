@@ -15,7 +15,7 @@ class RPC {
   }
 
   netdelay () {
-    return 500 * (Math.random() + 0.5)
+    return 200 * (Math.random() + 0.5)
   }
 
   server (handler) {
@@ -31,6 +31,7 @@ class RPC {
           let text = Buffer.concat(parts).toString('utf8')
           json = JSON.parse(text)
           setTimeout(() => {
+            if (!(json && 'FROM' in json)) console.log('\n')
             console.log(chalk[color]('%d %d IN<- %s %s %s %s'), Date.now(), this.id, json && json.FROM, id, name, JSON.stringify(json, null, 2))
             resolve(json)
           }, this.netdelay())
@@ -38,7 +39,10 @@ class RPC {
           result => [200, new Buffer(JSON.stringify(outdata = result, null, 2) + '\n', 'utf8')],
           error => [500, new Buffer(JSON.stringify(outdata = (error instanceof Error ? error.toString() : error), null, 2) + '\n', 'utf8')]
         ).then(code_buf => {
-          console.log(chalk[color]('%d %d IN-> %s %s %s'), Date.now(), this.id, json && json.FROM, id, JSON.stringify(outdata, null, 2))
+          // suppress return line for one-way calls
+          if (outdata !== undefined || !(json && 'CLOCK' in json)) {
+            console.log(chalk[color].bold('%d %d IN-> %s %s %s'), Date.now(), this.id, json && json.FROM, id, JSON.stringify(outdata, null, 2))
+          }
           setTimeout(() => {
             res.writeHead(code_buf[0], {
               'Content-Length': code_buf[1].length,
@@ -647,14 +651,12 @@ class State {
     let cb = this._subCallbacks.get(args.id)
     this._subCallbacks.delete(args.id)
     cb()
-    return null
   }
 
   rpc_barrier_down (args) {
     let cb = this._barrierCallbacks.get(args.id)
     this._barrierCallbacks.delete(args.id)
     cb(args.epoch)
-    return null
   }
 
   rpc_barrier_up (args) {
@@ -698,7 +700,6 @@ class State {
       }
       this._rpc.qcall(args.FROM, 'subscribe_down', { index, id: args.id })
     })
-    return null
   }
 }
 
