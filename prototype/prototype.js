@@ -52,7 +52,7 @@ class RPC {
   }
 
   call (dest, name, args) {
-    let id = '#' + this._next_id++
+    // let id = '#' + this._next_id++
     args.FROM = this.id
     args.CLOCK = Date.now()
     // console.log(chalk.black.bold('%s %s OU-> %s %s %s %s'), Date.now(), this.id, dest, id, name, JSON.stringify(args, null, 2))
