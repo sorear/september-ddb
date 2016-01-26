@@ -155,7 +155,7 @@ class Binding {
       let out = []
       let tmp = []
       for (let part of text.split('.')) {
-        if (tmp.length) out.push(tmp.join('.'))
+        if (tmp.length) out.push('p' + tmp.join('.'))
         tmp.push(part)
       }
       return out
@@ -164,13 +164,13 @@ class Binding {
     switch (narrow[0]) {
       case 'k':
         let kparts = narrow.substring(1).split(',')
-        return ['a', `t${kparts[0]}`, `e${kparts[0]},${kparts[1]}`, plist(kparts[1])]
+        return ['a', `t${kparts[0]}`, `e${kparts[0]},${kparts[1]}`, ...plist(kparts[1])]
       case 't': return ['a']
       case 'e':
         let eparts = narrow.substring(1).split(',')
-        return ['a', `t${eparts[0]}`, plist(eparts[1])]
+        return ['a', `t${eparts[0]}`, ...plist(eparts[1])]
       case 'r': return [`t${narrow.substring(1)}`, 'a']
-      case 'p': return [plist(narrow.substring(1)), 'a']
+      case 'p': return [...plist(narrow.substring(1)), 'a']
       default: return []
     }
   }
@@ -745,6 +745,41 @@ class State {
         index.push({ key, value: this._myIndices.get(key) })
       }
       this._rpc.qcall(args.FROM, 'subscribe_down', { index, id: args.id })
+    })
+  }
+
+  rpc_eav_put (args) {
+    if (!args.id) args.id = this.allocateArc()
+    let { promise, resolver } = promiseAndResolver()
+    this._injectQueue.push({
+      data: Object.keys(args.data).map(kk => {
+        return {
+          key: `${args.table},${args.id},${kk}`,
+          value: { d: args.data[kk], v: Date.now() }
+        }
+      }),
+      callback: resolver
+    })
+    this.epochSoon()
+    return promise.then(() => ({ id: args.id, epoch: this._epoch }))
+  }
+
+  rpc_eav_get (args) {
+    let ikey = `e${args.table},${args.id}`
+    return this.waitForIndices([ikey]).then(() => {
+      let res = {}
+      for (let dd of this._myIndices.get(ikey)) {
+        let kparts = dd[0].split(',')
+        res[kparts[2]] = dd[1].d
+      }
+      return res
+    })
+  }
+
+  rpc_eav_search (args) {
+    let ikey = args.col ? `r${args.table},${args.col},${args.value}` : `t${args.table}`
+    return this.waitForIndices([ikey]).then(() => {
+      return Array.from(new Set(this._myIndices.get(ikey).map(dd => dd[0].split(',')[1])))
     })
   }
 }
