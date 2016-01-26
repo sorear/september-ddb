@@ -132,20 +132,45 @@ class Binding {
   }
 
   ikMatches (ikey, entk, entv) {
+    let kparts = entk.split(',')
+    let iarg = ikey.substring(1)
     switch (ikey[0]) {
       case 'k':
-        return entk === ikey.substring(1)
-      case 'd':
-        return entv.d === ikey.substring(1)
+        return entk === iarg
+      case 't':
+        return kparts[0] === iarg
+      case 'e':
+        return `${kparts[0]},${kparts[1]}` === iarg
+      case 'r':
+        return `${kparts[0]},${kparts[2]},${entv.d}` === iarg
+      case 'p':
+        return (kparts[1] + '.').startsWith(iarg + '.') || (kparts[2][0] === '@' && (kparts[2].substring(1) + '.').startsWith(iarg + '.'))
       case 'a':
         return true
     }
   }
 
   ikFallback (narrow) {
+    const plist = (text) => {
+      let out = []
+      let tmp = []
+      for (let part of text.split('.')) {
+        if (tmp.length) out.push(tmp.join('.'))
+        tmp.push(part)
+      }
+      return out
+    }
+
     switch (narrow[0]) {
-      case 'k': return ['a']
-      case 'd': return ['a']
+      case 'k':
+        let kparts = narrow.substring(1).split(',')
+        return ['a', `t${kparts[0]}`, `e${kparts[0]},${kparts[1]}`, plist(kparts[1])]
+      case 't': return ['a']
+      case 'e':
+        let eparts = narrow.substring(1).split(',')
+        return ['a', `t${eparts[0]}`, plist(eparts[1])]
+      case 'r': return [`t${narrow.substring(1)}`, 'a']
+      case 'p': return [plist(narrow.substring(1)), 'a']
       default: return []
     }
   }
@@ -169,6 +194,7 @@ class Binding {
           }
         }
 
+        // TODO: for k-indices, we can find the answer in _any_ index
         need.add(ikey)
         return []
       }
@@ -643,6 +669,7 @@ class State {
   rpc_assign_arc (args) {
     this._openArc = args.arc
     ;(this._upIdResolver)()
+    this.waitForIndices([ 'p' + this._openArc ])
   }
 
   allocateArc () {
