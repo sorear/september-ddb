@@ -118,7 +118,7 @@ class Binding {
     let need = new Set()
     let value = null
 
-    if (superval === undefined && state._upId) {
+    if (superval === undefined && state.upId === null) {
       // currently used in all branches.  not fundamental
       need.add(ikey)
     }
@@ -144,7 +144,7 @@ class Binding {
           if (match === null || ent[1].d === match) {
             // might still be stale
             let updata = state._upIndices.get(ent[0])
-            if (state._upId && !updata) {
+            if (state.upId && !updata) {
               // we don't know if this is stale
               need.add(ent[0])
             }
@@ -178,7 +178,10 @@ class State {
 
     // # Upstream control
     // ID of upstream, if any
-    this._upId = null
+    this._upId = undefined
+    let { promise: upPromise, resolver: upResolver } = promiseAndResolver()
+    this._upIdPromise = upPromise
+    this._upIdResolver = upResolver
     // Last upstream epoch which is known to us
     this._upEpoch = 0
     // Upstream-exposed index values, map from name to (opaque)
@@ -221,6 +224,10 @@ class State {
     // [{ system, clock, target }]
     this._ancestorTriggers = []
     this._rsiblings = new Map()
+  }
+
+  get upId () {
+    if (this._upId === undefined) throw new Error('_upId not yet set')
   }
 
   newEpoch () {
@@ -296,7 +303,7 @@ class State {
     }
 
     for (let sno of this._sibQueue.splice(0)) {
-      if (sno.upId !== this._upId) {
+      if (sno.upId !== this.upId) {
         continue
       }
 
@@ -348,14 +355,14 @@ class State {
     }
 
     // pass data changes up
-    if (this._upId && data_vec.length > 0) {
-      this._rpc.qcall(this._upId, 'replicate_up', { epoch: new_epoch, data: data_vec })
+    if (this.upId && data_vec.length > 0) {
+      this._rpc.qcall(this.upId, 'replicate_up', { epoch: new_epoch, data: data_vec })
     }
 
     for (let sib of this._siblings.values()) {
       if (data_vec.length > 0 || this.checkClockTriggers(sib)) {
         this._rpc.qcall(sib.id, 'replicate_sibling', {
-          upId: this._upId,
+          upId: this.upId,
           upEpoch: this._upEpoch,
           clocks: clocks_changed,
           data: data_vec
@@ -425,8 +432,8 @@ class State {
   addTrigger (system, clock, cb) {
     if (!this._ancestorTriggers.some(trig => trig.system === system && trig.clock === clock)) {
       // this is a wholly new trigger!  notify our rsibs and ancestors that We Care about this and they should send it even if there's no salient data
-      if (this._upId) {
-        this._rpc.qcall(this._upId, 'notify_trigger', { system, clock })
+      if (this.upId) {
+        this._rpc.qcall(this.upId, 'notify_trigger', { system, clock })
       }
       for (let rs of this._rsiblings.values()) {
         this._rpc.qcall(rs.id, 'notify_trigger', { system, clock })
@@ -456,7 +463,7 @@ class State {
           this.updatePartnerClocks(partner)
         } else {
           this._rpc.qcall(partner.id, 'replicate_sibling', {
-            upId: this._upId, upEpoch: this._upEpoch, clocks: this.diffClocks(partner.sentClocks), data: []
+            upId: this.upId, upEpoch: this._upEpoch, clocks: this.diffClocks(partner.sentClocks), data: []
           })
           this.updatePartnerClocks(partner)
         }
@@ -507,7 +514,7 @@ class State {
         request.add(req)
       }
       ready = false
-      if (request.size === 0 || !this._upId) {
+      if (request.size === 0 || !this.upId) {
         throw new Error('calculateRequirements invalidly returned empty')
       }
     }
@@ -520,7 +527,7 @@ class State {
     let id = this._nextSubId++
     let subscribed = new Promise((resolve, reject) => this._subCallbacks.set(id, resolve))
 
-    this._rpc.qcall(this._upId, 'subscribe', { id, keys: Array.from(request) }) // does not need to be anchored to epoch
+    this._rpc.qcall(this.upId, 'subscribe', { id, keys: Array.from(request) }) // does not need to be anchored to epoch
     return subscribed.then(() => this.waitForIndices(keys))
   }
 
@@ -536,7 +543,7 @@ class State {
     this._siblings.set(args.id, { id: args.id, sentClocks: new Map(this._ancestorClocks), triggerClocks: [] })
 
     let msg = {
-      upId: this._upId,
+      upId: this.upId,
       upEpoch: this._upEpoch,
       clocks: this.dumpClocks(),
       data: []
@@ -558,12 +565,24 @@ class State {
     }
   }
 
+  initok_become_root () {}
+  rpc_become_root (args) {
+    if (this._upId !== undefined) {
+      throw new Error('too late to become a root')
+    }
+
+    this._upId = null
+    ;(this._upIdResolver)()
+  }
+
+  initok_connect_up () {}
   rpc_connect_up (args) {
-    if (this._upId || this._downstreams.size > 0 || this._data.size > 0) {
+    if (this._upId !== undefined) {
       throw new Error('too late to become a cache')
     }
 
     this._upId = args.id
+    ;(this._upIdResolver)()
     this._upEpoch = 0
     this._rpc.qcall(args.id, 'connect_down', {})
   }
@@ -605,7 +624,7 @@ class State {
   }
 
   doBarrier (target) {
-    if (!this._upId) {
+    if (!this.upId) {
       return Promise.resolve(0)
     }
     if (target === this._rpc.id) {
@@ -614,7 +633,7 @@ class State {
     let id = this._barrierNextId++
     let { promise, resolver } = promiseAndResolver()
     this._barrierCallbacks.set(id, resolver)
-    this._rpc.qcall(this._upId, 'barrier_up', { target, id })
+    this._rpc.qcall(this.upId, 'barrier_up', { target, id })
     return promise
   }
 
@@ -649,7 +668,8 @@ process.env.PORT.split(',').forEach(port => {
   rpc.server((cmd, args) => {
     let fn = state[`rpc_${cmd}`]
     if (fn) {
-      return fn.call(state, args)
+      let pp = state[`initok_${cmd}`] ? Promise.resolve(null) : state._upIdPromise
+      return pp.then(() => fn.call(state, args))
     } else {
       throw new Error('invalid command')
     }
