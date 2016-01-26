@@ -5,7 +5,7 @@ const chalk = require('chalk')
 
 class RPC {
   constructor (id) {
-    this._id = id
+    this._id = '' + id
     this._next_id = 1
     this._readyp = new Map()
   }
@@ -483,7 +483,11 @@ class State {
         this._rpc.qcall(rs.id, 'notify_trigger', { system, clock })
       }
     }
-    this._ancestorTriggers.push({ system, clock, cb })
+    if ((this._ancestorClocks.get(system) || 0) >= clock) {
+      if (cb) cb()
+    } else {
+      this._ancestorTriggers.push({ system, clock, cb })
+    }
   }
 
   rpc_notify_trigger (args) {
@@ -535,7 +539,7 @@ class State {
 
   rpc_acquire (args) {
     let { promise, resolver } = promiseAndResolver()
-    this.addTrigger(args.system, args.clock, resolver)
+    this.addTrigger('' + args.system, args.clock, resolver)
     return promise
   }
 
@@ -584,6 +588,7 @@ class State {
   }
 
   rpc_connect_sibling (args) {
+    args.id = '' + args.id
     this._siblings.set(args.id, { id: args.id, sentClocks: new Map(this._ancestorClocks), triggerClocks: [] })
 
     let msg = {
@@ -625,7 +630,7 @@ class State {
       throw new Error('too late to become a cache')
     }
 
-    this._upId = args.id
+    this._upId = '' + args.id
     ;(this._upIdResolver)()
     this._upEpoch = 0
     this._rpc.qcall(args.id, 'connect_down', {})
@@ -680,7 +685,7 @@ class State {
   }
 
   rpc_barrier (args) {
-    return this.doBarrier(args.target)
+    return this.doBarrier('' + args.target)
   }
 
   rpc_get (args) {
