@@ -225,6 +225,9 @@ class State {
     let { promise: upPromise, resolver: upResolver } = promiseAndResolver()
     this._upIdPromise = upPromise
     this._upIdResolver = upResolver
+    this._openArc = undefined
+    this._nextArc = 1
+
     // Last upstream epoch which is known to us
     this._upEpoch = 0
     // Upstream-exposed index values, map from name to (opaque)
@@ -621,6 +624,7 @@ class State {
     }
 
     this._upId = null
+    this._openArc = '' + this._rpc.id
     ;(this._upIdResolver)()
   }
 
@@ -631,13 +635,23 @@ class State {
     }
 
     this._upId = '' + args.id
-    ;(this._upIdResolver)()
     this._upEpoch = 0
     this._rpc.qcall(args.id, 'connect_down', {})
   }
 
+  initok_assign_arc () {}
+  rpc_assign_arc (args) {
+    this._openArc = args.arc
+    ;(this._upIdResolver)()
+  }
+
+  allocateArc () {
+    return `${this._openArc}.${this._nextArc++}`
+  }
+
   rpc_connect_down (args) {
     this._downstreams.set(args.FROM, { id: args.FROM, want: new Set(), sentClocks: new Map(this._ancestorClocks), triggerClocks: [] })
+    this._rpc.qcall(args.FROM, 'assign_arc', { arc: this.allocateArc() })
     this._rpc.qcall(args.FROM, 'replicate_down', { epoch: this._epoch, clocks: this.dumpClocks(), containsTo: 0, index: [] })
   }
 
@@ -715,7 +729,7 @@ process.env.PORT.split(',').forEach(port => {
     let fn = state[`rpc_${cmd}`]
     if (fn) {
       let pp = []
-      if (!state[`initok_${cmd}`] && state._upId === undefined) pp.push(state._upIdPromise)
+      if (!state[`initok_${cmd}`]) pp.push(state._upIdPromise)
       if ('CLOCK' in args) pp.push(waitUntil(args.CLOCK))
       // should diagnose an error and drop packets if >2s future
       return Promise.all(pp).then(() => fn.call(state, args))
