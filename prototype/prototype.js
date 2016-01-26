@@ -54,6 +54,7 @@ class RPC {
   call (dest, name, args) {
     let id = '#' + this._next_id++
     args.FROM = this.id
+    args.CLOCK = Date.now()
     console.log(chalk.black.bold('%s %s OU-> %s %s %s %s'), Date.now(), this.id, dest, id, name, JSON.stringify(args, null, 2))
     let prom = got.post(`http://localhost:${dest}/${name}`,
       { body: JSON.stringify(args, null, 2), json: true }).then(response => response.body, err => { throw err.response.body })
@@ -100,6 +101,21 @@ function promiseAndResolver () {
   let resolver
   let promise = new Promise((resolve, reject) => resolver = resolve)
   return { promise, resolver }
+}
+
+function waitUntil (now) {
+  let { promise, resolver } = promiseAndResolver()
+
+  function check () {
+    let diff = now - Date.now()
+    if (diff <= 0) {
+      resolver(null)
+    } else {
+      setTimeout(check, diff)
+    }
+  }
+  check()
+  return promise
 }
 
 class Binding {
@@ -387,7 +403,7 @@ class State {
 
     for (let barrier of this._barrierQueue.splice(0)) {
       this.doBarrier(barrier.target).then(epoch => {
-        return this._rpc.qcall(barrier.from, 'barrier_down', { epoch, id: barrier.id })
+        this._rpc.qcall(barrier.from, 'barrier_down', { epoch, id: barrier.id })
       })
     }
   }
@@ -668,8 +684,11 @@ process.env.PORT.split(',').forEach(port => {
   rpc.server((cmd, args) => {
     let fn = state[`rpc_${cmd}`]
     if (fn) {
-      let pp = state[`initok_${cmd}`] ? Promise.resolve(null) : state._upIdPromise
-      return pp.then(() => fn.call(state, args))
+      let pp = []
+      if (!state[`initok_${cmd}`] && state._upId === undefined) pp.push(state._upIdPromise)
+      if ('CLOCK' in args) pp.push(waitUntil(args.CLOCK))
+      // should diagnose an error and drop packets if >2s future
+      return Promise.all(pp).then(() => fn.call(state, args))
     } else {
       throw new Error('invalid command')
     }
