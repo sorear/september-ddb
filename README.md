@@ -46,3 +46,35 @@ Data cannot be interpreted in isolation; indices always require higher-level ind
 To support reading newly created data without requiring a round trip to the root system, the object ID space is partitioned and each system pre-receives a subscription to its portion of the ID space.
 Data replication behaves as a state-based CRDT.
 Support for operational CRDTs is planned but will probably require audit log integration, as sideways replication would otherwise allow multipathing.
+
+## Technical risk items
+
+In descending order of riskiness.
+
+* Distribution: While the scheme has been designed to minimize the logical depth of operations required to process each request,
+that does not guarantee that implementing a system as a distributed cluster will actually work.
+If it doesn't work, that derails this whole plan.
+
+* Linearizable operations: We intend to offer these, although they will not be the default.
+They are largely not even designed.
+Current thought is that a linearizable operation must be explicitly targeted at a single system, and may reach it by way of RPC.
+
+* View system: The hard part is not calculating the views, but establishing the precise consistency rules that should apply to them.
+Updating a view will take time and if a system maintains views,
+it should not wait for the views to compute before propagate non-view changes to downstream systems.
+Thus we would like replicated views to be able to explicitly indicate an older version, which probably requires an additional set of barriers to manage them.}"}"
+There are many details to work out here.
+
+* Modularity: Especially as the view system grows, the functionality associated with a system will become quite large.
+Can we, in any meaningful way, declare the view system to be "not part of topounbase" and firewall its complexity?
+
+* Deletion: Deleting data with tombstones is easy enough.
+It is not clear how we could decide when tombstones can safely be removed.
+
+* Security: We would like to support various kinds of partially-trusted system and various kinds of sensitive/compartmentalized data.
+Design work here has barely begun.
+
+* Operational CRDTs, the audit log, and explicit indication of crossed writes: This is largely designed and expected to work.
+
+* Removing the ultrametric limitation: I'm not sure this is possible, but we can live without doing it.
+This is closely tied to the behavior of sibling replication.
