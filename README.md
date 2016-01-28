@@ -9,7 +9,7 @@ topounbase (which needs a better name) is a distributed database which ignores m
 topounbase can also be seen as a "NoSQL database" which treats XDCR and frontend caching as first-class citizens and gives them a sane consistency model.
 
 topounbase achieves causal+ consistency without tracking dependency metadata or requiring all systems to see all updates.
-As such it defies the assumptions and conclusions of [The Potential Dangers of Causal Consistency and an Explicit Solution][http://db.cs.berkeley.edu/papers/socc12-explicit.pdf].
+As such it defies the assumptions and conclusions of [The Potential Dangers of Causal Consistency and an Explicit Solution](http://db.cs.berkeley.edu/papers/socc12-explicit.pdf).
 
 ## How it works
 
