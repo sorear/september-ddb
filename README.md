@@ -65,6 +65,10 @@ it should not wait for the views to compute before propagate non-view changes to
 Thus we would like replicated views to be able to explicitly indicate an older version, which probably requires an additional set of barriers to manage them.}"}"
 There are many details to work out here.
 
+* Eviction: This is clearly needed for a functioning cache hierarchy but has barely been designed.
+Since topounbase uses inclusive caching, an eviction at an intermediate level forces lower levels to evict;
+this could prove problematic for anything that has outstanding read requests.
+
 * Modularity: Especially as the view system grows, the functionality associated with a system will become quite large.
 Can we, in any meaningful way, declare the view system to be "not part of topounbase" and firewall its complexity?
 
