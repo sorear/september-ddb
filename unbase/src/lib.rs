@@ -1,13 +1,15 @@
 extern crate lmdb;
 extern crate uuid;
 extern crate capnp;
+extern crate byteorder;
 
 mod unbase_capnp {
     include!(concat!(env!("OUT_DIR"), "/unbase_capnp.rs"));
 }
-use lmdb::{RoTransaction, Transaction};
+use lmdb::{RoTransaction, RwTransaction, Transaction, WriteFlags};
 use std::collections::HashSet;
 use uuid::Uuid;
+use byteorder::{ByteOrder, NativeEndian};
 
 mod keys {
     pub const SIGNATURE : u8 = 1;
@@ -18,6 +20,8 @@ mod keys {
     pub const STATE_BY_ID : u8 = 6;
     pub const UP_SYSTEM_UUID : u8 = 7;
     pub const UP_SYSTEM_EPOCH : u8 = 8;
+    pub const THIS_SYSTEM_EPOCH : u8 = 9;
+    pub const KNOWN_CLOCKS : u8 = 10;
 
     pub const SIGNATURE_VALUE : &'static str = "Unbase/T database";
     pub const SIGVERSION_VALUE : u32 = 0x10000;
@@ -61,18 +65,22 @@ enum ObjectState {
 
 struct Error;
 impl From<lmdb::Error> for Error {
+    fn from(e: lmdb::Error) -> Error {
+        unimplemented!()
+    }
 }
 type Result<T> = std::result::Result<T, Error>;
 
+// TODO(soon): actually use read contexts
 struct ReadContext<'txn> {
     tx: &'txn lmdb::RoTransaction<'txn>,
     db: lmdb::Database,
 }
 
 struct WriteContext<'txn> {
-    tx: &'txn lmdb::RwTransaction<'txn>,
+    tx: &'txn mut lmdb::RwTransaction<'txn>,
     db: lmdb::Database,
-    updated_keys: HashSet<Vec<u8>>,
+    current_epoch: i64,
 }
 
 impl<'txn> WriteContext<'txn> {
@@ -81,12 +89,21 @@ impl<'txn> WriteContext<'txn> {
     }
 }
 
-fn probe_prefixes(ctx: &ReadContext, id: &[u8]) -> Result<bool> {
-    let prefix_len = id.len();
+// TODO upstream
+fn get_opt<'txn, TX : Transaction, K : AsRef<[u8]>>(txn: &'txn TX, database: lmdb::Database, key: &K) -> lmdb::Result<Option<&'txn [u8]>> {
+    match txn.get(database, key) {
+        Ok(val) => Ok(Some(val)),
+        Err(lmdb::Error::NotFound) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn probe_prefixes(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
+    let mut prefix_len = id.len();
     loop {
         let mut key_buf = vec![keys::SUBSCRIBED_PREFIXES];
         key_buf.extend_from_slice(&id[0 .. prefix_len]);
-        if try!(ctx.tx.get(&ctx.db, &key_buf).is_some() { return Ok(true); }
+        if try!(get_opt(ctx.tx, ctx.db, &key_buf)).is_some() { return Ok(true); }
         if prefix_len == 0 { return Ok(false); }
 
         prefix_len -= 1;
@@ -102,7 +119,16 @@ fn bytes_to_i64(bytes: &[u8]) -> Option<i64> {
     if bytes.len() == 8 { Some(NativeEndian::read_i64(bytes)) } else { None }
 }
 
-fn get_up_epoch(ctx: &ReadContext) -> i64 {
+fn i64_to_bytes(data: i64) -> [u8; 8] {
+    let mut buf = [0; 8];
+    NativeEndian::write_i64(&mut buf, data);
+    buf
+}
+
+fn increment_epoch(ctx: &mut WriteContext) -> Result<()> {
+    ctx.current_epoch += 1; // TODO(soon) overflow
+    try!(ctx.tx.put(ctx.db, &vec![keys::THIS_SYSTEM_EPOCH], &i64_to_bytes(ctx.current_epoch), WriteFlags::empty()));
+    Ok(())
 }
 
 fn update_data(ctx: &WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) {
@@ -116,6 +142,8 @@ fn update_data(ctx: &WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>
 }
 
 fn update_clock(ctx: &WriteContext, system: &Uuid, clock: i64) {
+    let mut clock_key_buf = vec![keys::KNOWN_CLOCKS];
+    clock_key_buf.extend_from_slice(system.as_bytes());
     // max()
 }
 
