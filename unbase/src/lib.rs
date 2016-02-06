@@ -22,6 +22,7 @@ mod keys {
     pub const UP_SYSTEM_EPOCH : u8 = 8;
     pub const THIS_SYSTEM_EPOCH : u8 = 9;
     pub const KNOWN_CLOCKS : u8 = 10;
+    pub const SUBSCRIBED_NAMES : u8 = 11;
 
     pub const SIGNATURE_VALUE : &'static str = "Unbase/T database";
     pub const SIGVERSION_VALUE : u32 = 0x10000;
@@ -111,6 +112,24 @@ fn probe_prefixes(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
     }
 }
 
+fn has_up_system(ctx: &WriteContext) -> Result<bool> {
+    let val = try!(get_opt(ctx.tx, ctx.db, &[keys::UP_SYSTEM_UUID]));
+    Ok(val.is_some())
+}
+
+fn probe_name(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
+    if !try!(has_up_system(ctx)) {
+        return Ok(true); // root system has all
+    }
+
+    let mut key_buf = vec![keys::SUBSCRIBED_NAMES];
+    key_buf.extend_from_slice(id);
+
+    if try!(get_opt(ctx.tx, ctx.db, &key_buf)).is_some() { return Ok(true); }
+    if try!(probe_prefixes(ctx, id)) { return Ok(true); }
+    Ok(false)
+}
+
 fn bytes_to_u32(bytes: &[u8]) -> Option<u32> {
     if bytes.len() == 4 { Some(NativeEndian::read_u32(bytes)) } else { None }
 }
@@ -131,20 +150,36 @@ fn increment_epoch(ctx: &mut WriteContext) -> Result<()> {
     Ok(())
 }
 
-fn update_data(ctx: &WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) {
-    // are we missing cache data for the entity or operation?  return NOT_READY
-    // do we already have the operation?  return SUCCESS
-    //    have op. ID -> check operation for any state other than initial
-    //    no op. ID -> check if current state is >= passed state
-    // append to local operation buffer
-    // apply to local state
-    // apply changes in local state to local delta indices
+enum UpdateDataResult {
+    NotReady,
 }
 
-fn update_clock(ctx: &WriteContext, system: &Uuid, clock: i64) {
+fn update_data(ctx: &WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) -> Result<UpdateDataResult> {
+    if !try!(probe_name(ctx, entity_id)) { return Ok(UpdateDataResult::NotReady); }
+    match operation_id {
+        Some(op_id) => {
+            if !try!(probe_name(ctx, op_id)) { return Ok(UpdateDataResult::NotReady); }
+            // TODO check for non-initial state
+        }
+        None => {
+            // TODO check if current state dominates operation_data
+        }
+    }
+    unimplemented!()
+    // TODO append to local operation buffer
+    // TODO apply to local state
+    // TODO apply changes in local state to local delta indices
+}
+
+fn update_clock(ctx: &mut WriteContext, system: &Uuid, clock: i64) -> Result<()> {
     let mut clock_key_buf = vec![keys::KNOWN_CLOCKS];
     clock_key_buf.extend_from_slice(system.as_bytes());
-    // max()
+    let old_clock = try!(get_opt(ctx.tx, ctx.db, &clock_key_buf)).and_then(bytes_to_i64).unwrap_or(0);
+    if clock > old_clock {
+        try!(ctx.tx.put(ctx.db, &clock_key_buf, &i64_to_bytes(clock), WriteFlags::empty()));
+        // TODO record and forward change
+    }
+    Ok(())
 }
 
 fn apply_replicate_down() {
