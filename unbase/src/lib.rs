@@ -7,7 +7,7 @@ extern crate byteorder;
 mod unbase_capnp {
     include!(concat!(env!("OUT_DIR"), "/unbase_capnp.rs"));
 }
-use lmdb::{RoTransaction, RwTransaction, Transaction, WriteFlags};
+use lmdb::{RoTransaction, RwTransaction, Transaction, WriteFlags, Cursor};
 use uuid::Uuid;
 use byteorder::{ByteOrder, NativeEndian};
 
@@ -28,13 +28,22 @@ mod keys {
     pub const LATTICE_DELTA_BY_ID : u8 = 13;
     pub const LATTICE_DELTA_EPOCH : u8 = 14;
     pub const CHANGE_LATTICE_DELTA : u8 = 15;
+    pub const OPS_BY_OP_ID : u8 = 16;
+    pub const OPS_BY_ENTITY_ID : u8 = 17;
+    pub const OPS_BY_ENTITY_ID_EPOCH : u8 = 18;
+    pub const CHANGE_OP_DELTA : u8 = 19;
 
     pub const SIGNATURE_VALUE : &'static str = "Unbase/T database";
     pub const SIGVERSION_VALUE : u32 = 0x10000;
+    pub const ID_INVALID : u8 = 0x80;
 }
 
 mod binding {
     pub fn lattice_edit(_key: &[u8], _up_val: &[u8], _change: &[u8]) -> Vec<u8> {
+        unimplemented!()
+    }
+
+    pub fn op_edit(_value: &[u8], _op: &[u8]) -> Vec<u8> {
         unimplemented!()
     }
 
@@ -43,6 +52,10 @@ mod binding {
     }
 
     pub fn default_state(_key: &[u8]) -> Vec<u8> {
+        unimplemented!()
+    }
+
+    pub fn deleted() -> Vec<u8> {
         unimplemented!()
     }
 }
@@ -209,6 +222,18 @@ fn get_computed_state(ctx: &WriteContext, entity_id: &[u8]) -> Result<Option<Vec
     if let Some(ldelta) = try!(ctx.get_opt(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id])) {
         up_state = binding::lattice_edit(entity_id, &up_state, ldelta);
     }
+    if try!(ctx.get_opt(&vec2![keys::OPS_BY_OP_ID, ...entity_id])).is_some() {
+        up_state = binding::deleted();
+    }
+    let op_prefix = vec2![keys::OPS_BY_ENTITY_ID, ...entity_id, keys::ID_INVALID];
+    {
+        for (kref, vref) in try!(ctx.tx.open_ro_cursor(ctx.db)).iter_from(&op_prefix) {
+            if !kref.starts_with(&op_prefix) {
+                break;
+            }
+            up_state = binding::op_edit(&up_state, vref);
+        }
+    }
 
     Ok(Some(up_state))
 }
@@ -223,13 +248,21 @@ macro_rules! unwrap_or {
 }
 
 fn update_data(ctx: &mut WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) -> Result<bool> {
+    let epoch = ctx.current_epoch;
     match operation_id {
         Some(op_id) => {
+            let opcstate = unwrap_or!(try!(get_computed_state(ctx, op_id)), return Ok(false));
+            // do we already have the operation?
+            if opcstate != binding::default_state(op_id) { return Ok(true); }
+            // we can't accept an operation unless we already have the object (need to be able to fully predict the index change)
             if !try!(probe_name(ctx, entity_id)) { return Ok(false); }
-            if !try!(probe_name(ctx, op_id)) { return Ok(false); }
-            // TODO check for non-initial state
-            // TODO figure out how this works
-            unimplemented!()
+            // record it as a change
+            try!(ctx.put(&vec2![keys::OPS_BY_OP_ID, ...op_id], &[])); // TODO use in get_computed_state
+            try!(ctx.put(&vec2![keys::OPS_BY_ENTITY_ID, ...entity_id, keys::ID_INVALID, ...op_id], &operation_data)); // TODO use in get_computed_state
+            try!(ctx.put(&vec2![keys::OPS_BY_ENTITY_ID_EPOCH, ...entity_id, keys::ID_INVALID, ...op_id], &i64_to_bytes(epoch)));
+            // propagate
+            try!(ctx.put(&vec2![keys::CHANGE_OP_DELTA, ...op_id, keys::ID_INVALID, ...entity_id], &operation_data));
+            Ok(true)
         }
         None => {
             let cstate = unwrap_or!(try!(get_computed_state(ctx, entity_id)), return Ok(false));
@@ -245,7 +278,6 @@ fn update_data(ctx: &mut WriteContext, entity_id: &[u8], operation_id: Option<&[
             };
             // apply to local state
             try!(ctx.put(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id], &nchange));
-            let epoch = ctx.current_epoch;
             try!(ctx.put(&vec2![keys::LATTICE_DELTA_EPOCH, ...entity_id], &i64_to_bytes(epoch)));
             // TODO apply changes in local state to local delta indices
             // propagate this change up/sideways
