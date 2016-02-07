@@ -8,7 +8,6 @@ mod unbase_capnp {
     include!(concat!(env!("OUT_DIR"), "/unbase_capnp.rs"));
 }
 use lmdb::{RoTransaction, RwTransaction, Transaction, WriteFlags};
-use std::collections::HashSet;
 use uuid::Uuid;
 use byteorder::{ByteOrder, NativeEndian};
 
@@ -18,7 +17,7 @@ mod keys {
     pub const SYSTEM_UUID : u8 = 3;
     pub const DATABASE_UUID : u8 = 4;
     pub const SUBSCRIBED_PREFIXES : u8 = 5;
-    pub const STATE_BY_ID : u8 = 6;
+    pub const UP_STATE_BY_ID : u8 = 6;
     pub const UP_SYSTEM_UUID : u8 = 7;
     pub const UP_SYSTEM_EPOCH : u8 = 8;
     pub const THIS_SYSTEM_EPOCH : u8 = 9;
@@ -26,9 +25,26 @@ mod keys {
     pub const SUBSCRIBED_NAMES : u8 = 11;
     // CHANGE_xyz are never committed, temp storage during update pass
     pub const CHANGE_CLOCK : u8 = 12;
+    pub const LATTICE_DELTA_BY_ID : u8 = 13;
+    pub const LATTICE_DELTA_EPOCH : u8 = 14;
+    pub const CHANGE_LATTICE_DELTA : u8 = 15;
 
     pub const SIGNATURE_VALUE : &'static str = "Unbase/T database";
     pub const SIGVERSION_VALUE : u32 = 0x10000;
+}
+
+mod binding {
+    pub fn lattice_edit(_key: &[u8], _up_val: &[u8], _change: &[u8]) -> Vec<u8> {
+        unimplemented!()
+    }
+
+    pub fn lattice_combine(_key: &[u8], _ed1: &[u8], _ed2: &[u8]) -> Vec<u8> {
+        unimplemented!()
+    }
+
+    pub fn default_state(_key: &[u8]) -> Vec<u8> {
+        unimplemented!()
+    }
 }
 
 macro_rules! push_list {
@@ -91,7 +107,7 @@ enum ObjectState {
 
 struct Error;
 impl From<lmdb::Error> for Error {
-    fn from(e: lmdb::Error) -> Error {
+    fn from(_e: lmdb::Error) -> Error {
         unimplemented!()
     }
 }
@@ -118,14 +134,14 @@ impl<'txn> WriteContext<'txn> {
         try!(self.tx.put(self.db, key, val, WriteFlags::empty()));
         Ok(())
     }
-}
 
-// TODO upstream
-fn get_opt<'txn, TX : Transaction, K : AsRef<[u8]>>(txn: &'txn TX, database: lmdb::Database, key: &K) -> lmdb::Result<Option<&'txn [u8]>> {
-    match txn.get(database, key) {
-        Ok(val) => Ok(Some(val)),
-        Err(lmdb::Error::NotFound) => Ok(None),
-        Err(err) => Err(err),
+    // TODO upstream
+    fn get_opt<K: AsRef<[u8]>>(&self, key: &K) -> lmdb::Result<Option<&[u8]>> {
+        match self.tx.get(self.db, key) {
+            Ok(val) => Ok(Some(val)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -133,7 +149,7 @@ fn probe_prefixes(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
     let mut prefix_len = id.len();
     loop {
         let key = vec2![keys::SUBSCRIBED_PREFIXES, ...&id[0 .. prefix_len]];
-        if try!(get_opt(ctx.tx, ctx.db, &key)).is_some() { return Ok(true); }
+        if try!(ctx.get_opt(&key)).is_some() { return Ok(true); }
         if prefix_len == 0 { return Ok(false); }
 
         prefix_len -= 1;
@@ -142,7 +158,7 @@ fn probe_prefixes(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
 }
 
 fn has_up_system(ctx: &WriteContext) -> Result<bool> {
-    let val = try!(get_opt(ctx.tx, ctx.db, &[keys::UP_SYSTEM_UUID]));
+    let val = try!(ctx.get_opt(&[keys::UP_SYSTEM_UUID]));
     Ok(val.is_some())
 }
 
@@ -151,8 +167,7 @@ fn probe_name(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
         return Ok(true); // root system has all
     }
 
-    let key = vec2![keys::SUBSCRIBED_NAMES, ...id];
-    if try!(get_opt(ctx.tx, ctx.db, &key)).is_some() { return Ok(true); }
+    if try!(ctx.get_opt(&vec2![keys::SUBSCRIBED_NAMES, ...id])).is_some() { return Ok(true); }
     if try!(probe_prefixes(ctx, id)) { return Ok(true); }
     Ok(false)
 }
@@ -182,26 +197,67 @@ enum UpdateDataResult {
     NotReady,
 }
 
-fn update_data(ctx: &WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) -> Result<UpdateDataResult> {
-    if !try!(probe_name(ctx, entity_id)) { return Ok(UpdateDataResult::NotReady); }
-    match operation_id {
-        Some(op_id) => {
-            if !try!(probe_name(ctx, op_id)) { return Ok(UpdateDataResult::NotReady); }
-            // TODO check for non-initial state
-        }
-        None => {
-            // TODO check if current state dominates operation_data
+fn get_computed_state(ctx: &WriteContext, entity_id: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !try!(probe_name(ctx, entity_id)) {
+        return Ok(None)
+    }
+
+    let mut up_state = match try!(ctx.get_opt(&vec2![keys::UP_STATE_BY_ID, ...entity_id])) {
+        Some(upref) => upref.to_owned(),
+        None => binding::default_state(entity_id),
+    };
+    if let Some(ldelta) = try!(ctx.get_opt(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id])) {
+        up_state = binding::lattice_edit(entity_id, &up_state, ldelta);
+    }
+
+    Ok(Some(up_state))
+}
+
+macro_rules! unwrap_or {
+    ($opt:expr, $els:stmt) => {
+        match $opt {
+            Some(val) => val,
+            None => { $els },
         }
     }
-    unimplemented!()
-    // TODO append to local operation buffer
-    // TODO apply to local state
-    // TODO apply changes in local state to local delta indices
+}
+
+fn update_data(ctx: &mut WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) -> Result<bool> {
+    match operation_id {
+        Some(op_id) => {
+            if !try!(probe_name(ctx, entity_id)) { return Ok(false); }
+            if !try!(probe_name(ctx, op_id)) { return Ok(false); }
+            // TODO check for non-initial state
+            // TODO figure out how this works
+            unimplemented!()
+        }
+        None => {
+            let cstate = unwrap_or!(try!(get_computed_state(ctx, entity_id)), return Ok(false));
+            let nstate = binding::lattice_edit(entity_id, &cstate, operation_data);
+            // check if current state dominates operation_data
+            if nstate == cstate {
+                return Ok(true);
+            }
+            // append to local operation buffer
+            let nchange = match try!(ctx.get_opt(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id])) {
+                None => operation_data.to_owned(),
+                Some(ochval) => binding::lattice_combine(entity_id, ochval, operation_data),
+            };
+            // apply to local state
+            try!(ctx.put(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id], &nchange));
+            let epoch = ctx.current_epoch;
+            try!(ctx.put(&vec2![keys::LATTICE_DELTA_EPOCH, ...entity_id], &i64_to_bytes(epoch)));
+            // TODO apply changes in local state to local delta indices
+            // propagate this change up/sideways
+            try!(ctx.put(&vec2![keys::CHANGE_LATTICE_DELTA, ...entity_id], &nchange));
+            Ok(true)
+        }
+    }
 }
 
 fn update_clock(ctx: &mut WriteContext, system: &Uuid, clock: i64) -> Result<()> {
     let clock_key = vec2![keys::KNOWN_CLOCKS, ...system.as_bytes()];
-    let old_clock = try!(get_opt(ctx.tx, ctx.db, &clock_key)).and_then(bytes_to_i64).unwrap_or(0);
+    let old_clock = try!(ctx.get_opt(&clock_key)).and_then(bytes_to_i64).unwrap_or(0);
     if clock > old_clock {
         try!(ctx.put(&clock_key, &i64_to_bytes(clock)));
         try!(ctx.put(&vec2![keys::CHANGE_CLOCK, ...system.as_bytes()], &i64_to_bytes(clock)));
@@ -228,9 +284,6 @@ fn apply_replicate_up() {
 fn apply_replicate_sibling() {
     // update passed clocks
     // update_data for each passed operation
-}
-
-fn epoch_bump_index(tx: &mut lmdb::RwTransaction) {
 }
 
 #[test]
