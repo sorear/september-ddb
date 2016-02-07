@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 extern crate lmdb;
 extern crate uuid;
 extern crate capnp;
@@ -23,6 +24,8 @@ mod keys {
     pub const THIS_SYSTEM_EPOCH : u8 = 9;
     pub const KNOWN_CLOCKS : u8 = 10;
     pub const SUBSCRIBED_NAMES : u8 = 11;
+    // CHANGE_xyz are never committed, temp storage during update pass
+    pub const CHANGE_CLOCK : u8 = 12;
 
     pub const SIGNATURE_VALUE : &'static str = "Unbase/T database";
     pub const SIGVERSION_VALUE : u32 = 0x10000;
@@ -110,6 +113,11 @@ impl<'txn> WriteContext<'txn> {
     fn as_ro(&self) -> ReadContext<'txn> {
         unimplemented!()
     }
+
+    fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: &K, val: &V) -> Result<()> {
+        try!(self.tx.put(self.db, key, val, WriteFlags::empty()));
+        Ok(())
+    }
 }
 
 // TODO upstream
@@ -165,7 +173,8 @@ fn i64_to_bytes(data: i64) -> [u8; 8] {
 
 fn increment_epoch(ctx: &mut WriteContext) -> Result<()> {
     ctx.current_epoch += 1; // TODO(soon) overflow
-    try!(ctx.tx.put(ctx.db, &vec![keys::THIS_SYSTEM_EPOCH], &i64_to_bytes(ctx.current_epoch), WriteFlags::empty()));
+    let epoch = ctx.current_epoch;
+    try!(ctx.put(&vec![keys::THIS_SYSTEM_EPOCH], &i64_to_bytes(epoch)));
     Ok(())
 }
 
@@ -194,8 +203,8 @@ fn update_clock(ctx: &mut WriteContext, system: &Uuid, clock: i64) -> Result<()>
     let clock_key = vec2![keys::KNOWN_CLOCKS, ...system.as_bytes()];
     let old_clock = try!(get_opt(ctx.tx, ctx.db, &clock_key)).and_then(bytes_to_i64).unwrap_or(0);
     if clock > old_clock {
-        try!(ctx.tx.put(ctx.db, &clock_key, &i64_to_bytes(clock), WriteFlags::empty()));
-        // TODO record and forward change
+        try!(ctx.put(&clock_key, &i64_to_bytes(clock)));
+        try!(ctx.put(&vec2![keys::CHANGE_CLOCK, ...system.as_bytes()], &i64_to_bytes(clock)));
     }
     Ok(())
 }
