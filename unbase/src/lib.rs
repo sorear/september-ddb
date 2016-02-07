@@ -28,6 +28,28 @@ mod keys {
     pub const SIGVERSION_VALUE : u32 = 0x10000;
 }
 
+macro_rules! push_list {
+    ($vec:expr, ...$list:expr, $($rest:tt)*) => {
+        $vec.extend($list);
+        push_list!($vec, $($rest)*);
+    };
+    ($vec:expr, ...$list:expr) => { push_list!($vec, ...$list,) };
+    ($vec:expr, $item:expr, $($rest:tt)*) => {
+        $vec.push($item);
+        push_list!($vec, $($rest)*);
+    };
+    ($vec:expr, $item:expr) => { push_list!($vec, $item,) };
+    ($vec:expr,) => {};
+}
+
+macro_rules! vec2 {
+    ($($part:tt)*) => {{
+        let mut vec = Vec::new();
+        push_list!(vec, $($part)*);
+        vec
+    }};
+}
+
 // for the second pass, our data is stored in an LMDB object
 // LMDB keys:
 // #1 : general bookkeeping data
@@ -102,9 +124,8 @@ fn get_opt<'txn, TX : Transaction, K : AsRef<[u8]>>(txn: &'txn TX, database: lmd
 fn probe_prefixes(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
     let mut prefix_len = id.len();
     loop {
-        let mut key_buf = vec![keys::SUBSCRIBED_PREFIXES];
-        key_buf.extend_from_slice(&id[0 .. prefix_len]);
-        if try!(get_opt(ctx.tx, ctx.db, &key_buf)).is_some() { return Ok(true); }
+        let key = vec2![keys::SUBSCRIBED_PREFIXES, ...&id[0 .. prefix_len]];
+        if try!(get_opt(ctx.tx, ctx.db, &key)).is_some() { return Ok(true); }
         if prefix_len == 0 { return Ok(false); }
 
         prefix_len -= 1;
@@ -122,10 +143,8 @@ fn probe_name(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
         return Ok(true); // root system has all
     }
 
-    let mut key_buf = vec![keys::SUBSCRIBED_NAMES];
-    key_buf.extend_from_slice(id);
-
-    if try!(get_opt(ctx.tx, ctx.db, &key_buf)).is_some() { return Ok(true); }
+    let key = vec2![keys::SUBSCRIBED_NAMES, ...id];
+    if try!(get_opt(ctx.tx, ctx.db, &key)).is_some() { return Ok(true); }
     if try!(probe_prefixes(ctx, id)) { return Ok(true); }
     Ok(false)
 }
@@ -172,11 +191,10 @@ fn update_data(ctx: &WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>
 }
 
 fn update_clock(ctx: &mut WriteContext, system: &Uuid, clock: i64) -> Result<()> {
-    let mut clock_key_buf = vec![keys::KNOWN_CLOCKS];
-    clock_key_buf.extend_from_slice(system.as_bytes());
-    let old_clock = try!(get_opt(ctx.tx, ctx.db, &clock_key_buf)).and_then(bytes_to_i64).unwrap_or(0);
+    let clock_key = vec2![keys::KNOWN_CLOCKS, ...system.as_bytes()];
+    let old_clock = try!(get_opt(ctx.tx, ctx.db, &clock_key)).and_then(bytes_to_i64).unwrap_or(0);
     if clock > old_clock {
-        try!(ctx.tx.put(ctx.db, &clock_key_buf, &i64_to_bytes(clock), WriteFlags::empty()));
+        try!(ctx.tx.put(ctx.db, &clock_key, &i64_to_bytes(clock), WriteFlags::empty()));
         // TODO record and forward change
     }
     Ok(())
