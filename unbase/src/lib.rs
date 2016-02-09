@@ -156,6 +156,24 @@ impl<'txn> WriteContext<'txn> {
             Err(err) => Err(err),
         }
     }
+
+    fn get_next(&mut self, prefix: &[u8], after: &mut Option<Vec<u8>>) -> lmdb::Result<Option<&[u8]>> {
+        let mut csr = try!(self.tx.open_ro_cursor(self.db));
+        let val = match *after {
+            None => {
+                csr.iter_from(prefix).nth(0)
+            }
+            Some(ref after_val) => {
+                csr.iter_from(&vec2![...prefix, ...after_val]).nth(1)
+            }
+        };
+        if let Some((k, v)) = val {
+            if !k.starts_with(prefix) { return Ok(None); }
+            *after = Some((&k[prefix.len() ..]).to_owned());
+            return Ok(Some(v));
+        }
+        Ok(None)
+    }
 }
 
 fn probe_prefixes(ctx: &WriteContext, id: &[u8]) -> Result<bool> {
@@ -210,6 +228,7 @@ enum UpdateDataResult {
     NotReady,
 }
 
+// TODO switch to caching the computed state
 fn get_computed_state(ctx: &WriteContext, entity_id: &[u8]) -> Result<Option<Vec<u8>>> {
     if !try!(probe_name(ctx, entity_id)) {
         return Ok(None)
@@ -245,6 +264,41 @@ macro_rules! unwrap_or {
             None => { $els },
         }
     }
+}
+
+// TODO bug(?) iter should hold the cursor's lifetime, not the txn's
+// we expect that Θ(1) of the values will be cleared in each call, so we need no index
+fn cull_upstreamed_edits(ctx: &mut WriteContext, included_epoch: i64) -> Result<()> {
+    let mut prev_lattice_key = None;
+    loop {
+        let delete_me = {
+            let epoch_ref = unwrap_or!(try!(ctx.get_next(&[keys::LATTICE_DELTA_EPOCH], &mut prev_lattice_key)), break);
+            bytes_to_i64(epoch_ref).unwrap_or(0) <= included_epoch
+        };
+        if delete_me {
+            let lkey = prev_lattice_key.as_ref().unwrap();
+            try!(ctx.tx.del(ctx.db, &vec2![keys::LATTICE_DELTA_EPOCH, ...lkey], None));
+            try!(ctx.tx.del(ctx.db, &vec2![keys::LATTICE_DELTA_BY_ID, ...lkey], None));
+        }
+    }
+
+    let mut prev_ops_key = None;
+    loop {
+        let delete_me = {
+            let epoch_ref = unwrap_or!(try!(ctx.get_next(&[keys::OPS_BY_ENTITY_ID_EPOCH], &mut prev_ops_key)), break);
+            bytes_to_i64(epoch_ref).unwrap_or(0) <= included_epoch
+        };
+        if delete_me {
+            let opskey = prev_ops_key.as_ref().unwrap();
+            try!(ctx.tx.del(ctx.db, &vec2![keys::OPS_BY_ENTITY_ID, ...opskey], None));
+            try!(ctx.tx.del(ctx.db, &vec2![keys::OPS_BY_ENTITY_ID_EPOCH, ...opskey], None));
+            let bkpt = opskey.iter().position(|x| *x == keys::ID_INVALID).unwrap_or(0);
+            try!(ctx.tx.del(ctx.db, &vec2![keys::OPS_BY_OP_ID, ...&opskey[bkpt + 1 ..]], None));
+        }
+    }
+
+    // TODO: update local indices
+    Ok(())
 }
 
 fn update_data(ctx: &mut WriteContext, entity_id: &[u8], operation_id: Option<&[u8]>, operation_data: &[u8]) -> Result<bool> {
