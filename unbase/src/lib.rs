@@ -32,6 +32,7 @@ mod keys {
     pub const OPS_BY_ENTITY_ID : u8 = 17;
     pub const OPS_BY_ENTITY_ID_EPOCH : u8 = 18;
     pub const CHANGE_OP_DELTA : u8 = 19;
+    pub const COMPUTED_BY_ENTITY_ID : u8 = 20;
 
     pub const SIGNATURE_VALUE : &'static str = "Unbase/T database";
     pub const SIGVERSION_VALUE : u32 = 0x10000;
@@ -148,6 +149,11 @@ impl<'txn> WriteContext<'txn> {
         Ok(())
     }
 
+    fn del<K: ?Sized + AsRef<[u8]>>(&mut self, key: &K) -> Result<()> {
+        try!(self.tx.del(self.db, &key, None));
+        Ok(())
+    }
+
     // TODO upstream
     fn get_opt<K: AsRef<[u8]>>(&self, key: &K) -> lmdb::Result<Option<&[u8]>> {
         match self.tx.get(self.db, key) {
@@ -228,21 +234,21 @@ enum UpdateDataResult {
     NotReady,
 }
 
-// TODO switch to caching the computed state
-fn get_computed_state(ctx: &WriteContext, entity_id: &[u8]) -> Result<Option<Vec<u8>>> {
+fn recalc_computed_state(ctx: &mut WriteContext, entity_id: &[u8]) -> Result<()> {
     if !try!(probe_name(ctx, entity_id)) {
-        return Ok(None)
+        return Ok(())
     }
 
-    let mut up_state = match try!(ctx.get_opt(&vec2![keys::UP_STATE_BY_ID, ...entity_id])) {
+    let orig_state = match try!(ctx.get_opt(&vec2![keys::UP_STATE_BY_ID, ...entity_id])) {
         Some(upref) => upref.to_owned(),
         None => binding::default_state(entity_id),
     };
+    let mut state = orig_state.clone();
     if let Some(ldelta) = try!(ctx.get_opt(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id])) {
-        up_state = binding::lattice_edit(entity_id, &up_state, ldelta);
+        state = binding::lattice_edit(entity_id, &state, ldelta);
     }
     if try!(ctx.get_opt(&vec2![keys::OPS_BY_OP_ID, ...entity_id])).is_some() {
-        up_state = binding::deleted();
+        state = binding::deleted();
     }
     let op_prefix = vec2![keys::OPS_BY_ENTITY_ID, ...entity_id, keys::ID_INVALID];
     {
@@ -250,11 +256,34 @@ fn get_computed_state(ctx: &WriteContext, entity_id: &[u8]) -> Result<Option<Vec
             if !kref.starts_with(&op_prefix) {
                 break;
             }
-            up_state = binding::op_edit(&up_state, vref);
+            state = binding::op_edit(&state, vref);
         }
     }
 
-    Ok(Some(up_state))
+    if state != orig_state {
+        try!(ctx.put(&vec2![keys::COMPUTED_BY_ENTITY_ID, ...entity_id], &state));
+    } else {
+        try!(ctx.del(&vec2![keys::COMPUTED_BY_ENTITY_ID, ...entity_id]));
+    }
+    // TODO: propagate!
+
+    Ok(())
+}
+
+fn get_computed_state(ctx: &WriteContext, entity_id: &[u8]) -> Result<Option<Vec<u8>>> {
+    if let Some(cref) = try!(ctx.get_opt(&vec2![keys::COMPUTED_BY_ENTITY_ID, ...entity_id])) {
+        return Ok(Some(cref.to_owned()));
+    }
+
+    if let Some(cref) = try!(ctx.get_opt(&vec2![keys::UP_STATE_BY_ID, ...entity_id])) {
+        return Ok(Some(cref.to_owned()));
+    }
+
+    if try!(probe_name(ctx, entity_id)) {
+        return Ok(Some(binding::default_state(entity_id)));
+    }
+
+    return Ok(None);
 }
 
 macro_rules! unwrap_or {
