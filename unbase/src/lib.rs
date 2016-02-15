@@ -308,6 +308,7 @@ fn cull_upstreamed_edits(ctx: &mut WriteContext, included_epoch: i64) -> Result<
             let lkey = prev_lattice_key.as_ref().unwrap();
             try!(ctx.tx.del(ctx.db, &vec2![keys::LATTICE_DELTA_EPOCH, ...lkey], None));
             try!(ctx.tx.del(ctx.db, &vec2![keys::LATTICE_DELTA_BY_ID, ...lkey], None));
+            try!(recalc_computed_state(ctx, lkey));
         }
     }
 
@@ -323,6 +324,8 @@ fn cull_upstreamed_edits(ctx: &mut WriteContext, included_epoch: i64) -> Result<
             try!(ctx.tx.del(ctx.db, &vec2![keys::OPS_BY_ENTITY_ID_EPOCH, ...opskey], None));
             let bkpt = opskey.iter().position(|x| *x == keys::ID_INVALID).unwrap_or(0);
             try!(ctx.tx.del(ctx.db, &vec2![keys::OPS_BY_OP_ID, ...&opskey[bkpt + 1 ..]], None));
+            try!(recalc_computed_state(ctx, &opskey[bkpt + 1 ..]));
+            try!(recalc_computed_state(ctx, &opskey[0 .. bkpt]));
         }
     }
 
@@ -340,9 +343,11 @@ fn update_data(ctx: &mut WriteContext, entity_id: &[u8], operation_id: Option<&[
             // we can't accept an operation unless we already have the object (need to be able to fully predict the index change)
             if !try!(probe_name(ctx, entity_id)) { return Ok(false); }
             // record it as a change
-            try!(ctx.put(&vec2![keys::OPS_BY_OP_ID, ...op_id], &[])); // TODO use in get_computed_state
-            try!(ctx.put(&vec2![keys::OPS_BY_ENTITY_ID, ...entity_id, keys::ID_INVALID, ...op_id], &operation_data)); // TODO use in get_computed_state
+            try!(ctx.put(&vec2![keys::OPS_BY_OP_ID, ...op_id], &[]));
+            try!(ctx.put(&vec2![keys::OPS_BY_ENTITY_ID, ...entity_id, keys::ID_INVALID, ...op_id], &operation_data));
             try!(ctx.put(&vec2![keys::OPS_BY_ENTITY_ID_EPOCH, ...entity_id, keys::ID_INVALID, ...op_id], &i64_to_bytes(epoch)));
+            try!(recalc_computed_state(ctx, op_id));
+            try!(recalc_computed_state(ctx, entity_id));
             // propagate
             try!(ctx.put(&vec2![keys::CHANGE_OP_DELTA, ...op_id, keys::ID_INVALID, ...entity_id], &operation_data));
             Ok(true)
@@ -362,6 +367,7 @@ fn update_data(ctx: &mut WriteContext, entity_id: &[u8], operation_id: Option<&[
             // apply to local state
             try!(ctx.put(&vec2![keys::LATTICE_DELTA_BY_ID, ...entity_id], &nchange));
             try!(ctx.put(&vec2![keys::LATTICE_DELTA_EPOCH, ...entity_id], &i64_to_bytes(epoch)));
+            try!(recalc_computed_state(ctx, entity_id));
             // TODO apply changes in local state to local delta indices
             // propagate this change up/sideways
             try!(ctx.put(&vec2![keys::CHANGE_LATTICE_DELTA, ...entity_id], &nchange));
