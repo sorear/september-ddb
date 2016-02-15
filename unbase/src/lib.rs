@@ -149,9 +149,12 @@ impl<'txn> WriteContext<'txn> {
         Ok(())
     }
 
-    fn del<K: ?Sized + AsRef<[u8]>>(&mut self, key: &K) -> Result<()> {
-        try!(self.tx.del(self.db, &key, None));
-        Ok(())
+    fn del<K: ?Sized + AsRef<[u8]>>(&mut self, key: &K) -> lmdb::Result<bool> {
+        match self.tx.del(self.db, &key, None) {
+            Ok(_) => Ok(true),
+            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     // TODO upstream
