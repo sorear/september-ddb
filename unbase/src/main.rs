@@ -9,22 +9,23 @@ extern crate byteorder;
 extern crate hyper;
 extern crate serde_json;
 extern crate serde;
+extern crate time;
 
 use hyper::Server;
-use hyper::server::{Request, Response};
+use hyper::server::{Response, Request};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::io::Write;
-
-struct Transaction<'db> {
-    tx: lmdb::RwTransaction<'db>,
-    db: lmdb::Database,
-}
+use std::collections::HashSet;
+use std::cmp;
+use std::thread;
+use lmdb::{Transaction as LmdbTransaction, Cursor as LmdbCursor};
 
 #[derive(Debug)]
 enum Error {
     LmdbError(lmdb::Error),
     HyperError(hyper::Error),
+    JsonError(serde_json::Error),
 }
 
 impl From<lmdb::Error> for Error {
@@ -36,6 +37,12 @@ impl From<lmdb::Error> for Error {
 impl From<hyper::Error> for Error {
     fn from(e: hyper::Error) -> Error {
         Error::HyperError(e)
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Error {
+        Error::JsonError(e)
     }
 }
 
@@ -52,18 +59,74 @@ struct Operation {
     value: Vec<u8>,
 }
 
-impl<'db> Transaction<'db> {
-
+#[derive(Serialize,Deserialize)]
+enum DbKey {
+    LastMessageId(String),
+    QueuedMessages,
+    QueuedMessage(String, u64),
 }
 
-struct Database {
-    env: Arc<lmdb::Environment>,
+impl DbKey {
+    fn uplevel(&self) -> Option<DbKey> {
+        use DbKey::*;
+        match *self {
+            QueuedMessage(_, _) => Some(QueuedMessages),
+            _ => None,
+        }
+    }
+
+    fn to_str(&self) -> String {
+        let mut buf = String::new();
+        if let Some(up) = self.uplevel() {
+            buf = up.to_str();
+            buf.push('\t');
+        }
+        buf + &serde_json::to_string(self).unwrap()
+    }
+}
+
+struct DbState {
+    flush_running: HashSet<String>,
+}
+
+struct DbParts {
+    env: lmdb::Environment,
+    db: lmdb::Database,
+    st: DbState,
+}
+
+#[derive(Clone)]
+struct Database(Arc<Mutex<DbParts>>);
+
+struct Transaction<'db : 'tx,'tx> {
+    top: &'db Database,
+    env: &'db lmdb::Environment,
+    tx: &'tx mut lmdb::RwTransaction<'db>,
+    db: lmdb::Database,
+    st: &'db mut DbState,
 }
 
 impl Database {
     fn run(name: &str) -> Result<hyper::server::Listening> {
         let env = try!(lmdb::Environment::new().set_flags(lmdb::NO_SUB_DIR).open(&PathBuf::from(name)));
-        let db = Database { env: Arc::new(env) };
+        let ldb = try!(env.open_db(None));
+        let parts = DbParts {
+            env: env,
+            st: DbState { flush_running: HashSet::new() },
+            db: ldb,
+        };
+        let db = Database(Arc::new(Mutex::new(parts)));
+        let mut need_flush = HashSet::new();
+        db.transaction(|tx| {
+            let mut ist = tx.iter_key(DbKey::QueuedMessages);
+            while let Some(DbKey::QueuedMessage(peer, _)) = try!(tx.get_next_key(&mut ist)) {
+                need_flush.insert(peer);
+            }
+            Ok(())
+        });
+        for peer in need_flush {
+            db.flush_later(peer);
+        }
         let server = try!(Server::http(&*name));
         return Ok(try!(server.handle(db)));
     }
@@ -71,13 +134,193 @@ impl Database {
     fn handle2(&self, req: GRequest) -> GResponse {
         match req {
             GRequest::HelloRequest => GResponse::HelloReply,
+            GRequest::Message { .. } => unimplemented!(),
         }
+    }
+
+    fn transaction<F,R>(&self, cb: F) -> Result<R> where F: FnOnce(&mut Transaction) -> Result<R> {
+        let mut guard = self.0.lock().unwrap();
+        let mut state = &mut *guard;
+        let mut trx = try!(state.env.begin_rw_txn());
+        let res = try!(cb(&mut Transaction {
+            top: self,
+            db: state.db,
+            st: &mut state.st,
+            env: &state.env,
+            tx: &mut trx,
+        }));
+        try!(trx.commit());
+        Ok(res)
+    }
+
+    fn flush_later(&self, peer: String) {
+        let sref = self.clone();
+        thread::spawn(move || {
+            let added = sref.transaction(|tx| {
+                Ok::<bool,Error>(tx.st.flush_running.insert(peer.clone()))
+            }).unwrap();
+
+            if !added {
+                // there was already a flusher running.
+                // it cannot exit until it takes the lock AND sees an empty queue, so our message
+                // will go out.
+                return;
+            }
+
+            let mut just_sent = None::<u64>;
+            loop {
+                let opt_next = sref.transaction(|tx| {
+                    if let Some(msg_no) = just_sent.take() {
+                        tx.del_val(DbKey::QueuedMessage(peer.clone(), msg_no));
+                    }
+                    // find the next message ID.  If we don't find it, deregister ourself.
+                    let mut ist = tx.iter_key(DbKey::QueuedMessages);
+                    let mut found = 0;
+                    while let Some(DbKey::QueuedMessage(peer2, ix2)) = try!(tx.get_next_key(&mut ist)) {
+                        if peer2 == peer {
+                            found = cmp::max(ix2, found);
+                        }
+                    }
+                    if found == 0 {
+                        tx.st.flush_running.remove(&peer);
+                        Ok(None)
+                    } else {
+                        let body = try!(tx.get_val::<GRequest>(DbKey::QueuedMessage(peer.clone(), found))).unwrap();
+                        Ok(Some((found, body)))
+                    }
+                }).unwrap();
+                if let Some ((next_id, next_body)) = opt_next {
+                    // dispatch it using hyper
+                    unimplemented!();
+                    just_sent = Some(next_id);
+                } else {
+                    break;
+                }
+            }
+        });
     }
 }
 
-#[derive(Serialize,Deserialize)]
+#[derive(Clone,Serialize,Deserialize)]
+enum CMessage {
+    // causal messages
+}
+
+struct IterState {
+    prefix: Vec<u8>,
+    after: Option<Vec<u8>>,
+}
+
+impl<'db,'tx> Transaction<'db,'tx> {
+    fn get_opt_raw<K: AsRef<[u8]>>(&self, key: &K) -> lmdb::Result<Option<&[u8]>> {
+        match self.tx.get(self.db, key) {
+            Ok(val) => Ok(Some(val)),
+            Err(lmdb::Error::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn get_val<T>(&self, key: DbKey) -> Result<Option<T>> where T: serde::Deserialize {
+        let raw = try!(self.get_opt_raw(&key.to_str()));
+        match raw {
+            None => Ok(None),
+            Some(raw2) => Ok(Some(try!(serde_json::from_slice(&raw2)))),
+        }
+    }
+
+    fn set_val<T>(&mut self, key: DbKey, val: &T) -> Result<()> where T: serde::Serialize {
+        let raw = try!(serde_json::to_vec(&val));
+        try!(self.tx.put(self.db, &key.to_str(), &raw, lmdb::WriteFlags::empty()));
+        Ok(())
+    }
+
+    fn del_raw<K: ?Sized + AsRef<[u8]>>(&mut self, key: &K) -> lmdb::Result<bool> {
+        match self.tx.del(self.db, &key, None) {
+            Ok(_) => Ok(true),
+            Err(lmdb::Error::NotFound) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn del_val(&mut self, key: DbKey) -> Result<bool> {
+        return Ok(try!(self.del_raw(&key.to_str())));
+    }
+
+    fn get_next_raw(&self, state: &mut IterState) -> lmdb::Result<Option<(&[u8], &[u8])>> {
+        let mut csr = try!(self.tx.open_ro_cursor(self.db));
+        let val = match state.after {
+            None => {
+                csr.iter_from(&state.prefix).nth(0)
+            }
+            Some(ref after_val) => {
+                csr.iter_from(&after_val).nth(1)
+            }
+        };
+        if let Some((k, v)) = val {
+            if !k.starts_with(&state.prefix) { return Ok(None); }
+            state.after = Some(k.to_owned());
+            return Ok(Some((k, v)));
+        }
+        Ok(None)
+    }
+
+    fn iter_key(&self, prefix: DbKey) -> IterState {
+        let mut pfx = prefix.to_str().into_bytes();
+        pfx.push(b'\t');
+        IterState {
+            prefix: pfx,
+            after: None
+        }
+    }
+
+    fn get_next_key(&self, state: &mut IterState) -> Result<Option<DbKey>> {
+        if let Some((mut rkey, _)) = try!(self.get_next_raw(state)) {
+            if let Some(ix) = rkey.iter().rposition(|b| *b == b'\t') {
+                rkey = &rkey[ix + 1 ..];
+            }
+            if let Ok(key) = serde_json::from_slice(rkey) {
+                return Ok(Some(key));
+            }
+        }
+        return Ok(None);
+    }
+
+    fn now(&self) -> TAI64N {
+        let ts = time::get_time();
+        // TODO: ΔT, monotonicity
+        TAI64N { sec: ts.sec, nsec: ts.nsec }
+    }
+
+    fn send_to(&mut self, peer: &str, message: &CMessage) -> Result<()> {
+        // get the next ID for the peer
+        let last_msg_no = try!(self.get_val(DbKey::LastMessageId(peer.to_owned()))).unwrap_or(0u64);
+        let msg_no = last_msg_no + 1;
+
+        // save the message and the updated next ID
+        let req = GRequest::Message { body: message.clone(), stamp: self.now(), index: msg_no };
+        try!(self.set_val(DbKey::LastMessageId(peer.to_owned()), &msg_no));
+        try!(self.set_val(DbKey::QueuedMessage(peer.to_owned(), msg_no), &req));
+
+        // call flush_later (will wait until commit, and noop if we abort)
+        self.top.flush_later(peer.to_owned());
+        Ok(())
+    }
+}
+
+#[derive(Clone,Copy,Debug,Serialize,Deserialize)]
+struct TAI64N {
+    sec: i64,
+    nsec: i32,
+}
+
+#[derive(Clone,Serialize,Deserialize)]
 enum GRequest {
     HelloRequest,
+    Message {
+        body: CMessage,
+        stamp: TAI64N,
+        index: u64,
+    },
 }
 
 #[derive(Serialize,Deserialize)]
