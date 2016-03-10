@@ -26,6 +26,7 @@ enum Error {
     HyperError(hyper::Error),
     JsonError(serde_json::Error),
     UnexpectedReply(GResponse),
+    MessageOutOfOrder,
 }
 
 impl From<lmdb::Error> for Error {
@@ -62,6 +63,7 @@ struct Operation {
 #[derive(Serialize,Deserialize)]
 enum DbKey {
     LastMessageId(String),
+    LastReceivedId(String),
     QueuedMessages,
     QueuedMessage(String, u64),
 }
@@ -134,10 +136,24 @@ impl Database {
         return Ok(try!(server.handle(db)));
     }
 
-    fn handle2(&self, req: &GRequest) -> GResponse {
+    fn handle2(&self, req: &GRequest) -> Result<GResponse> {
         match *req {
-            GRequest::HelloRequest => GResponse::HelloReply,
-            GRequest::Message { .. } => unimplemented!(),
+            GRequest::HelloRequest => Ok(GResponse::HelloReply),
+            GRequest::Message { ref from, ref body, index, .. } => {
+                self.transaction(|tx| {
+                    let last_msg_no = try!(tx.get_val(DbKey::LastReceivedId(from.clone()))).unwrap_or(0u64);
+                    if index <= last_msg_no {
+                        // replay
+                        return Ok(GResponse::MessageOk);
+                    }
+                    if index != last_msg_no + 1 {
+                        return Err(Error::MessageOutOfOrder);
+                    }
+                    try!(tx.set_val(DbKey::LastReceivedId(from.clone()), &index));
+                    try!(tx.handle_message(from, body));
+                    Ok(GResponse::MessageOk)
+                })
+            }
         }
     }
 
@@ -326,6 +342,10 @@ impl<'db,'tx> Transaction<'db,'tx> {
         self.top.flush_later(peer.to_owned());
         Ok(())
     }
+
+    fn handle_message(&mut self, peer: &String, message: &CMessage) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone,Copy,Debug,Serialize,Deserialize)]
@@ -349,12 +369,16 @@ enum GRequest {
 enum GResponse {
     HelloReply,
     MessageOk,
+    Error(String),
 }
 
 impl hyper::server::Handler for Database {
     fn handle<'a, 'k>(&'a self, request: Request<'a, 'k>, mut response: Response<'a, hyper::net::Fresh>) {
         let reqj = serde_json::from_reader(request).unwrap();
-        let rpyj = self.handle2(&reqj);
+        let rpyj = match self.handle2(&reqj) {
+            Ok(r) => r,
+            Err(err) => GResponse::Error(format!("{:?}", err)),
+        };
         response.headers_mut().set(hyper::header::ContentType::json());
         let mut response = response.start().unwrap();
         serde_json::to_writer(&mut response, &rpyj).unwrap();
