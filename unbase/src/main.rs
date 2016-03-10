@@ -15,7 +15,6 @@ use hyper::Server;
 use hyper::server::{Response, Request};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::io::Write;
 use std::collections::HashSet;
 use std::cmp;
 use std::thread;
@@ -26,6 +25,7 @@ enum Error {
     LmdbError(lmdb::Error),
     HyperError(hyper::Error),
     JsonError(serde_json::Error),
+    UnexpectedReply(GResponse),
 }
 
 impl From<lmdb::Error> for Error {
@@ -96,7 +96,10 @@ struct DbParts {
 }
 
 #[derive(Clone)]
-struct Database(Arc<Mutex<DbParts>>);
+struct Database {
+    data: Arc<Mutex<DbParts>>,
+    name: String,
+}
 
 struct Transaction<'db : 'tx,'tx> {
     top: &'db Database,
@@ -115,15 +118,15 @@ impl Database {
             st: DbState { flush_running: HashSet::new() },
             db: ldb,
         };
-        let db = Database(Arc::new(Mutex::new(parts)));
+        let db = Database { data: Arc::new(Mutex::new(parts)), name: name.to_owned() };
         let mut need_flush = HashSet::new();
-        db.transaction(|tx| {
+        try!(db.transaction(|tx| {
             let mut ist = tx.iter_key(DbKey::QueuedMessages);
             while let Some(DbKey::QueuedMessage(peer, _)) = try!(tx.get_next_key(&mut ist)) {
                 need_flush.insert(peer);
             }
             Ok(())
-        });
+        }));
         for peer in need_flush {
             db.flush_later(peer);
         }
@@ -131,15 +134,15 @@ impl Database {
         return Ok(try!(server.handle(db)));
     }
 
-    fn handle2(&self, req: GRequest) -> GResponse {
-        match req {
+    fn handle2(&self, req: &GRequest) -> GResponse {
+        match *req {
             GRequest::HelloRequest => GResponse::HelloReply,
             GRequest::Message { .. } => unimplemented!(),
         }
     }
 
     fn transaction<F,R>(&self, cb: F) -> Result<R> where F: FnOnce(&mut Transaction) -> Result<R> {
-        let mut guard = self.0.lock().unwrap();
+        let mut guard = self.data.lock().unwrap();
         let mut state = &mut *guard;
         let mut trx = try!(state.env.begin_rw_txn());
         let res = try!(cb(&mut Transaction {
@@ -168,10 +171,11 @@ impl Database {
             }
 
             let mut just_sent = None::<u64>;
+            let client = hyper::client::Client::new();
             loop {
                 let opt_next = sref.transaction(|tx| {
                     if let Some(msg_no) = just_sent.take() {
-                        tx.del_val(DbKey::QueuedMessage(peer.clone(), msg_no));
+                        try!(tx.del_val(DbKey::QueuedMessage(peer.clone(), msg_no)));
                     }
                     // find the next message ID.  If we don't find it, deregister ourself.
                     let mut ist = tx.iter_key(DbKey::QueuedMessages);
@@ -191,8 +195,15 @@ impl Database {
                 }).unwrap();
                 if let Some ((next_id, next_body)) = opt_next {
                     // dispatch it using hyper
-                    unimplemented!();
-                    just_sent = Some(next_id);
+                    match dispatch(&client, &peer, next_body) {
+                        Ok(_) => {
+                            just_sent = Some(next_id);
+                        }
+                        Err(e) => {
+                            println!("dispatch {}: {:?}", peer, e);
+                            just_sent = None;
+                        }
+                    }
                 } else {
                     break;
                 }
@@ -201,9 +212,19 @@ impl Database {
     }
 }
 
+fn dispatch(client: &hyper::client::Client, peer: &str, message: GRequest) -> Result<()> {
+    let bytes = try!(serde_json::to_vec(&message));
+    let resp = try!(client.post(&format!("http://{}", peer)).header(hyper::header::ContentType::json()).body(&*bytes).send());
+    let rpy = try!(serde_json::from_reader(resp));
+    match rpy {
+        GResponse::MessageOk => Ok(()),
+        unex => Err(Error::UnexpectedReply(unex)),
+    }
+}
+
 #[derive(Clone,Serialize,Deserialize)]
 enum CMessage {
-    // causal messages
+    ExampleMessage,
 }
 
 struct IterState {
@@ -297,7 +318,7 @@ impl<'db,'tx> Transaction<'db,'tx> {
         let msg_no = last_msg_no + 1;
 
         // save the message and the updated next ID
-        let req = GRequest::Message { body: message.clone(), stamp: self.now(), index: msg_no };
+        let req = GRequest::Message { from: self.top.name.clone(), body: message.clone(), stamp: self.now(), index: msg_no };
         try!(self.set_val(DbKey::LastMessageId(peer.to_owned()), &msg_no));
         try!(self.set_val(DbKey::QueuedMessage(peer.to_owned(), msg_no), &req));
 
@@ -317,25 +338,27 @@ struct TAI64N {
 enum GRequest {
     HelloRequest,
     Message {
+        from: String,
         body: CMessage,
         stamp: TAI64N,
         index: u64,
     },
 }
 
-#[derive(Serialize,Deserialize)]
+#[derive(Clone,Debug,Serialize,Deserialize)]
 enum GResponse {
     HelloReply,
+    MessageOk,
 }
 
 impl hyper::server::Handler for Database {
     fn handle<'a, 'k>(&'a self, request: Request<'a, 'k>, mut response: Response<'a, hyper::net::Fresh>) {
         let reqj = serde_json::from_reader(request).unwrap();
-        let rpyj = self.handle2(reqj);
+        let rpyj = self.handle2(&reqj);
         response.headers_mut().set(hyper::header::ContentType::json());
         let mut response = response.start().unwrap();
-        serde_json::to_writer_pretty(&mut response, &rpyj).unwrap();
-        response.write(&[10u8]).unwrap();
+        serde_json::to_writer(&mut response, &rpyj).unwrap();
+        println!("CALL: {}: {} => {}", self.name, serde_json::to_string_pretty(&reqj).unwrap(), serde_json::to_string_pretty(&rpyj).unwrap());
     }
 }
 
