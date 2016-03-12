@@ -27,6 +27,7 @@ enum Error {
     JsonError(serde_json::Error),
     UnexpectedReply(GResponse),
     MessageOutOfOrder,
+    DatabaseAlreadyCreated,
 }
 
 impl From<lmdb::Error> for Error {
@@ -66,6 +67,7 @@ enum DbKey {
     LastReceivedId(String),
     QueuedMessages,
     QueuedMessage(String, u64),
+    TopState(String),
 }
 
 impl DbKey {
@@ -134,27 +136,6 @@ impl Database {
         }
         let server = try!(Server::http(&*name));
         return Ok(try!(server.handle(db)));
-    }
-
-    fn handle2(&self, req: &GRequest) -> Result<GResponse> {
-        match *req {
-            GRequest::HelloRequest => Ok(GResponse::HelloReply),
-            GRequest::Message { ref from, ref body, index, .. } => {
-                self.transaction(|tx| {
-                    let last_msg_no = try!(tx.get_val(DbKey::LastReceivedId(from.clone()))).unwrap_or(0u64);
-                    if index <= last_msg_no {
-                        // replay
-                        return Ok(GResponse::MessageOk);
-                    }
-                    if index != last_msg_no + 1 {
-                        return Err(Error::MessageOutOfOrder);
-                    }
-                    try!(tx.set_val(DbKey::LastReceivedId(from.clone()), &index));
-                    try!(tx.handle_message(from, body));
-                    Ok(GResponse::MessageOk)
-                })
-            }
-        }
     }
 
     fn transaction<F,R>(&self, cb: F) -> Result<R> where F: FnOnce(&mut Transaction) -> Result<R> {
@@ -233,7 +214,7 @@ fn dispatch(client: &hyper::client::Client, peer: &str, message: GRequest) -> Re
     let resp = try!(client.post(&format!("http://{}", peer)).header(hyper::header::ContentType::json()).body(&*bytes).send());
     let rpy = try!(serde_json::from_reader(resp));
     match rpy {
-        GResponse::MessageOk => Ok(()),
+        GResponse::Ok => Ok(()),
         unex => Err(Error::UnexpectedReply(unex)),
     }
 }
@@ -343,6 +324,37 @@ impl<'db,'tx> Transaction<'db,'tx> {
         Ok(())
     }
 
+    fn handle_request(&mut self, req: &GRequest) -> Result<GResponse> {
+        match *req {
+            GRequest::CreateDatabase { ref name } => {
+                let tstate = try!(self.get_val::<TopState>(DbKey::TopState(name.clone())));
+                if tstate.is_some() {
+                    return Err(Error::DatabaseAlreadyCreated);
+                }
+
+                try!(self.set_val(DbKey::TopState(name.clone()), &TopState::Root {
+                    uuid: SUuid(uuid::Uuid::new_v4()),
+                    reverse_siblings: vec![],
+                    siblings: vec![],
+                }));
+                Ok(GResponse::Ok)
+            },
+            GRequest::Message { ref from, ref body, index, .. } => {
+                let last_msg_no = try!(self.get_val(DbKey::LastReceivedId(from.clone()))).unwrap_or(0u64);
+                if index <= last_msg_no {
+                    // replay
+                    return Ok(GResponse::Ok);
+                }
+                if index != last_msg_no + 1 {
+                    return Err(Error::MessageOutOfOrder);
+                }
+                try!(self.set_val(DbKey::LastReceivedId(from.clone()), &index));
+                try!(self.handle_message(from, body));
+                Ok(GResponse::Ok)
+            }
+        }
+    }
+
     fn handle_message(&mut self, peer: &String, message: &CMessage) -> Result<()> {
         Ok(())
     }
@@ -354,28 +366,61 @@ struct TAI64N {
     nsec: i32,
 }
 
+#[derive(Debug,Display,Copy,Clone,Eq,PartialEq)]
+struct SUuid(pub uuid::Uuid);
+
+impl serde::Serialize for SUuid {
+    fn serialize<S: serde::Serializer>(&self, to: &mut S) -> std::result::Result<(), S::Error> {
+        self.0.to_hyphenated_string().serialize(to)
+    }
+}
+
+impl serde::Deserialize for SUuid {
+    fn deserialize<D: serde::Deserializer>(from: &mut D) -> std::result::Result<Self, D::Error> {
+        let strg = try!(String::deserialize(from));
+        match uuid::Uuid::parse_str(&strg) {
+            Ok(x) => Ok(SUuid(x)),
+            Err(s) => Err(serde::Error::custom(format!("{}", s))),
+        }
+    }
+}
+
+#[derive(Clone,Debug,Serialize,Deserialize)]
+enum TopState {
+    Root {
+        uuid: SUuid,
+        siblings: Vec<String>,
+        reverse_siblings: Vec<String>,
+    },
+    NonRoot {
+        uuid: SUuid,
+        parent: String,
+    }
+}
+
 #[derive(Clone,Serialize,Deserialize)]
 enum GRequest {
-    HelloRequest,
     Message {
         from: String,
         body: CMessage,
         stamp: TAI64N,
         index: u64,
     },
+    CreateDatabase {
+        name: String,
+    },
 }
 
 #[derive(Clone,Debug,Serialize,Deserialize)]
 enum GResponse {
-    HelloReply,
-    MessageOk,
+    Ok,
     Error(String),
 }
 
 impl hyper::server::Handler for Database {
     fn handle<'a, 'k>(&'a self, request: Request<'a, 'k>, mut response: Response<'a, hyper::net::Fresh>) {
         let reqj = serde_json::from_reader(request).unwrap();
-        let rpyj = match self.handle2(&reqj) {
+        let rpyj = match self.transaction(|tx| tx.handle_request(&reqj)) {
             Ok(r) => r,
             Err(err) => GResponse::Error(format!("{:?}", err)),
         };
