@@ -1,6 +1,6 @@
 [package]
 authors = ["Stefan O'Rear <stefanor@cox.net>"]
-build = "build.rs"
+# build = "build.rs"
 name = "unbase"
 version = "0.1.0"
 

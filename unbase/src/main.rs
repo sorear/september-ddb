@@ -14,11 +14,41 @@ extern crate time;
 use hyper::Server;
 use hyper::server::{Response, Request};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::collections::HashSet;
+use std::sync::{Arc, Condvar, Mutex};
+use std::collections::{HashMap, HashSet};
 use std::cmp;
 use std::thread;
 use lmdb::{Transaction as LmdbTransaction, Cursor as LmdbCursor};
+
+struct OneShotEvent<E> {
+    mutex: Mutex<Option<E>>,
+    condvar: Condvar,
+}
+
+impl<E> OneShotEvent<E> {
+    fn new() -> Self {
+        OneShotEvent {
+            mutex: Mutex::new(None),
+            condvar: Condvar::new()
+        }
+    }
+
+    fn put(&self, val: E) {
+        let mut mut_ref = self.mutex.lock().unwrap();
+        if mut_ref.is_none() {
+            *mut_ref = Some(val);
+            self.condvar.notify_all();
+        }
+    }
+
+    fn await(&self) -> E where E: Clone {
+        let mut mut_ref = self.mutex.lock().unwrap();
+        while mut_ref.is_none() {
+            mut_ref = self.condvar.wait(mut_ref).unwrap();
+        }
+        mut_ref.as_ref().unwrap().clone()
+    }
+}
 
 #[derive(Debug)]
 enum Error {
@@ -63,6 +93,7 @@ struct Operation {
 
 #[derive(Serialize,Deserialize)]
 enum DbKey {
+    ReceivedRequest(SUuid),
     LastMessageId(String),
     LastReceivedId(String),
     QueuedMessages,
@@ -91,6 +122,7 @@ impl DbKey {
 
 struct DbState {
     flush_running: HashSet<String>,
+    reply_ports: HashMap<SUuid, Arc<OneShotEvent<GResponse>>>,
 }
 
 struct DbParts {
@@ -119,7 +151,7 @@ impl Database {
         let ldb = try!(env.open_db(None));
         let parts = DbParts {
             env: env,
-            st: DbState { flush_running: HashSet::new() },
+            st: DbState { flush_running: HashSet::new(), reply_ports: HashMap::new() },
             db: ldb,
         };
         let db = Database { data: Arc::new(Mutex::new(parts)), name: name.to_owned() };
@@ -142,6 +174,7 @@ impl Database {
         let mut guard = self.data.lock().unwrap();
         let mut state = &mut *guard;
         let mut trx = try!(state.env.begin_rw_txn());
+        // TODO rollback changes to state.st if the callback fails
         let res = try!(cb(&mut Transaction {
             top: self,
             db: state.db,
@@ -151,6 +184,72 @@ impl Database {
         }));
         try!(trx.commit());
         Ok(res)
+    }
+
+    fn now(&self) -> TAI64N {
+        let ts = time::get_time();
+        // TODO: ΔT, monotonicity
+        TAI64N { sec: ts.sec, nsec: ts.nsec }
+    }
+
+    fn handle_request(&self, req: &GRequest) -> Result<GResponse> {
+        match *req {
+            GRequest::Command { ref body, ref id } => {
+                let port = try!(self.transaction(|tx| {
+                    // do we already have a waitqueue for this id?
+                    if let Some(port_ref) = tx.st.reply_ports.get(id) {
+                        return Ok(port_ref.clone());
+                    }
+                    let port = Arc::new(OneShotEvent::new());
+                    // do we already have a reply on file for this id?
+                    if let Some(rpy_ref) = try!(tx.get_val(DbKey::ReceivedRequest(id.clone()))) {
+                        match rpy_ref {
+                            Some(reply) => {
+                                port.put(reply);
+                            }
+                            None => {
+                                // we seem to have rebooted, things are in flight for this req
+                                tx.st.reply_ports.insert(*id, port.clone());
+                            }
+                        }
+                    } else {
+                        try!(tx.set_val(DbKey::ReceivedRequest(*id), &None::<GResponse>));
+                        tx.st.reply_ports.insert(*id, port.clone());
+                        // need to srart the command
+                        try!(tx.start_command(*id, body));
+                    }
+                    return Ok(port);
+                }));
+
+                return Ok(port.await());
+            },
+            GRequest::Message { ref from, ref body, index, .. } => {
+                self.transaction(|tx| {
+                    let last_msg_no = try!(tx.get_val(DbKey::LastReceivedId(from.clone()))).unwrap_or(0u64);
+                    if index <= last_msg_no {
+                        // replay
+                        return Ok(GResponse::Ok);
+                    }
+                    if index != last_msg_no + 1 {
+                        return Err(Error::MessageOutOfOrder);
+                    }
+                    try!(tx.set_val(DbKey::LastReceivedId(from.clone()), &index));
+                    try!(tx.handle_message(from, body));
+                    Ok(GResponse::Ok)
+                })
+            },
+            GRequest::AckReply { ref id } => {
+                self.transaction(|tx| {
+                    if !tx.st.reply_ports.contains_key(id) {
+                        try!(tx.del_val(DbKey::ReceivedRequest(*id)));
+                    }
+                    return Ok(GResponse::Ok);
+                })
+            },
+            GRequest::GetTime => {
+                Ok(GResponse::Time(self.now()))
+            },
+        }
     }
 
     fn flush_later(&self, peer: String) {
@@ -324,9 +423,43 @@ impl<'db,'tx> Transaction<'db,'tx> {
         Ok(())
     }
 
-    fn handle_request(&mut self, req: &GRequest) -> Result<GResponse> {
-        match *req {
-            GRequest::CreateDatabase { ref name } => {
+    fn command_reply(&mut self, id: SUuid, reply: &GResponse) -> Result<()> {
+        // only allow reply to be set once
+        match try!(self.get_val::<Option<GResponse>>(DbKey::ReceivedRequest(id))) {
+            None => {}, // very stale?
+            Some(Some(_)) => {}, // already set
+            Some(None) => {
+                try!(self.set_val(DbKey::ReceivedRequest(id), &Some(reply.clone())));
+
+                let tref = self.top.clone();
+                thread::spawn(move || {
+                    tref.transaction(|tx| {
+                        // we can't get here until the tx with the command reply has succeeded
+                        // or failed.  check which it was.
+                        match try!(tx.get_val(DbKey::ReceivedRequest(id))) {
+                            Some(Some(reply)) => {
+                                // oo, we have a reply
+                                if let Some(port) = tx.st.reply_ports.get(&id) {
+                                    port.put(reply);
+                                }
+                            },
+                            _ => {},
+                        }
+                        Ok(())
+                    }).unwrap();
+                });
+            }
+        }
+        return Ok(())
+    }
+
+    fn handle_message(&mut self, _peer: &String, _message: &CMessage) -> Result<()> {
+        Ok(())
+    }
+
+    fn start_command(&mut self, id: SUuid, cmd: &Command) -> Result<()> {
+        match *cmd {
+            Command::CreateDatabase { ref name } => {
                 let tstate = try!(self.get_val::<TopState>(DbKey::TopState(name.clone())));
                 if tstate.is_some() {
                     return Err(Error::DatabaseAlreadyCreated);
@@ -337,25 +470,9 @@ impl<'db,'tx> Transaction<'db,'tx> {
                     reverse_siblings: vec![],
                     siblings: vec![],
                 }));
-                Ok(GResponse::Ok)
+                try!(self.command_reply(id, &GResponse::Ok));
             },
-            GRequest::Message { ref from, ref body, index, .. } => {
-                let last_msg_no = try!(self.get_val(DbKey::LastReceivedId(from.clone()))).unwrap_or(0u64);
-                if index <= last_msg_no {
-                    // replay
-                    return Ok(GResponse::Ok);
-                }
-                if index != last_msg_no + 1 {
-                    return Err(Error::MessageOutOfOrder);
-                }
-                try!(self.set_val(DbKey::LastReceivedId(from.clone()), &index));
-                try!(self.handle_message(from, body));
-                Ok(GResponse::Ok)
-            }
         }
-    }
-
-    fn handle_message(&mut self, peer: &String, message: &CMessage) -> Result<()> {
         Ok(())
     }
 }
@@ -366,7 +483,7 @@ struct TAI64N {
     nsec: i32,
 }
 
-#[derive(Debug,Display,Copy,Clone,Eq,PartialEq)]
+#[derive(Debug,Copy,Clone,Eq,PartialEq,Hash)]
 struct SUuid(pub uuid::Uuid);
 
 impl serde::Serialize for SUuid {
@@ -406,6 +523,18 @@ enum GRequest {
         stamp: TAI64N,
         index: u64,
     },
+    Command {
+        id: SUuid,
+        body: Command,
+    },
+    AckReply {
+        id: SUuid,
+    },
+    GetTime,
+}
+
+#[derive(Clone,Serialize,Deserialize)]
+enum Command {
     CreateDatabase {
         name: String,
     },
@@ -414,13 +543,14 @@ enum GRequest {
 #[derive(Clone,Debug,Serialize,Deserialize)]
 enum GResponse {
     Ok,
+    Time(TAI64N),
     Error(String),
 }
 
 impl hyper::server::Handler for Database {
     fn handle<'a, 'k>(&'a self, request: Request<'a, 'k>, mut response: Response<'a, hyper::net::Fresh>) {
         let reqj = serde_json::from_reader(request).unwrap();
-        let rpyj = match self.transaction(|tx| tx.handle_request(&reqj)) {
+        let rpyj = match self.handle_request(&reqj) {
             Ok(r) => r,
             Err(err) => GResponse::Error(format!("{:?}", err)),
         };
