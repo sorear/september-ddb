@@ -1,8 +1,8 @@
 [package]
 authors = ["Stefan O'Rear <stefanor@cox.net>"]
 # build = "build.rs"
-name = "unbase"
-version = "0.1.0"
+name = "september"
+version = "0.2.0"
 
 [build-dependencies]
 capnpc = "0.6.0"
